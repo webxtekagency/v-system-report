@@ -29,7 +29,7 @@ EMAIL_SUBJECT="MyVestaCP System Report - $(date '+%Y-%m-%d')"  # Default email s
 # AI Integration Configuration
 AI_ENABLED=false  # Set to true to enable AI analysis
 AI_MODE="auto"   # Set to "auto" (default), "always", or "never"
-AI_API_KEY="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"     # Your HuggingFace API key
+AI_API_KEY=""     # Your HuggingFace API key
 AI_MODEL="mistralai/Mixtral-8x7B-Instruct-v0.1"  # Updated to Mixtral model
 AI_MAX_LENGTH=1000  # Maximum length of the response
 
