@@ -27,9 +27,9 @@ EMAIL_SUBJECT="MyVestaCP System Report - $(date '+%Y-%m-%d')"
 
 # AI Integration Configuration
 # Set to true to enable AI analysis of the report
-AI_ENABLED=true
+AI_ENABLED=false
 AI_MODE="auto"  # Options: "auto", "always", or "never"
-AI_API_KEY=""
+AI_API_KEY="" #Add your HuggingFace API key
 AI_MODEL="mistralai/Mixtral-8x7B-Instruct-v0.1"
 AI_MAX_LENGTH=1000
 
@@ -43,6 +43,9 @@ LOG_FILE=""
 # Global variables for HTML details and AI errors
 DETAILED_ISSUES_HTML=""
 AI_LAST_ERROR=""
+
+# Global variable to store detailed issue descriptions for email
+DETAILED_ISSUES_EMAIL=""
 
 # Function to setup logging
 setup_logging() {
@@ -174,7 +177,7 @@ log_email_status() {
     local status="$1"
     local recipient="$2"
     local method="$3"
-    local error="$4"
+    local message="$4"
     
     log_console "Exim4 Status:"
     log_file "Exim4 Status:"
@@ -188,37 +191,65 @@ log_email_status() {
     log_console "  Method: $method"
     log_file "  Method: $method"
     
-    if [ -n "$error" ]; then
-        log_console "  Error: $error"
-        log_file "  Error: $error"
+    if [ -n "$message" ]; then
+        if [ "$status" = "Success" ]; then
+            log_console "  Details: $message"
+            log_file "  Details: $message"
+        else
+            log_console "  Error: $message"
+            log_file "  Error: $message"
+        fi
     fi
 }
 
-# Function to check and install jq if needed
-check_and_install_jq() {
+# Function to check and install jq if not present
+function check_and_install_jq() {
     if ! command -v jq &> /dev/null; then
         log_message "${YELLOW}⚠️  jq not found. Installing jq...${NC}"
         if command -v apt-get &> /dev/null; then
-            apt-get update && apt-get install -y jq
+            run_with_timeout 30 "apt-get update && apt-get install -y jq"
         elif command -v yum &> /dev/null; then
-            yum install -y jq
+            run_with_timeout 30 "yum install -y jq"
         elif command -v dnf &> /dev/null; then
-            dnf install -y jq
+            run_with_timeout 30 "dnf install -y jq"
         else
             log_message "${RED}⚠️  Could not install jq. Package manager not found.${NC}"
             return 1
         fi
-        if command -v jq &> /dev/null; then
-            log_message "${GREEN}✓ jq installed successfully${NC}"
+        if [ $? -eq 0 ]; then
+            log_message "${GREEN}✓  jq installed successfully${NC}"
         else
             log_message "${RED}⚠️  Failed to install jq${NC}"
             return 1
         fi
     else
-        # Only show 'already installed' message at the start of the script
-        if [[ "$FUNCNAME[1]" != "analyze_with_ai" && "$FUNCNAME[1]" != "show_detailed_summary" && "$FUNCNAME[1]" != "main" ]]; then
-            log_message "${GREEN}✓ jq is already installed${NC}"
+        log_message "${GREEN}✓  jq already installed${NC}"
+    fi
+    return 0
+}
+
+# Function to check and install mutt if not present
+function check_and_install_mutt() {
+    if ! command -v mutt &> /dev/null; then
+        log_message "${YELLOW}⚠️  mutt not found. Installing mutt...${NC}"
+        if command -v apt-get &> /dev/null; then
+            run_with_timeout 60 "apt-get update && apt-get install -y mutt"
+        elif command -v yum &> /dev/null; then
+            run_with_timeout 60 "yum install -y mutt"
+        elif command -v dnf &> /dev/null; then
+            run_with_timeout 60 "dnf install -y mutt"
+        else
+            log_message "${RED}⚠️  Could not install mutt. Package manager not found.${NC}"
+            return 1
         fi
+        if [ $? -eq 0 ]; then
+            log_message "${GREEN}✓  mutt installed successfully${NC}"
+        else
+            log_message "${RED}⚠️  Failed to install mutt. Installation timed out or failed.${NC}"
+            return 1
+        fi
+    else
+        log_message "${GREEN}✓  mutt already installed${NC}"
     fi
     return 0
 }
@@ -426,9 +457,43 @@ Sending data to AI model..."
     # Create a temporary file for the JSON payload
     local temp_json=$(mktemp)
     
+    # Build a structured prompt with detailed scoring information for each module
+    local structured_prompt="MyVestaCP System Report Analysis Request\n\nPlease analyze the following system status report and provide recommendations. Format your response as follows:\n1. Critical Issues (if any):\n   - List critical issues here\n2. Medium Issues (if any):\n   - List medium issues here\n3. Low Issues (if any):\n   - List low issues here\n\nSystem Report Summary:\n"
+    
+    # Add overall system status with scores if available
+    if [ ${#detailed_report[@]} -gt 0 ]; then
+        structured_prompt+="Overall System Status:\n"
+        if [ $high_issues -gt 0 ]; then
+            structured_prompt+="- Critical Issues: $high_issues modules with critical problems\n"
+        elif [ $medium_issues -gt 0 ]; then
+            structured_prompt+="- Medium Issues: $medium_issues modules with medium problems\n"
+        elif [ $low_issues -gt 0 ]; then
+            structured_prompt+="- Low Issues: $low_issues modules with low problems\n"
+        else
+            structured_prompt+="- All systems operating normally\n"
+        fi
+        structured_prompt+="\n"
+    fi
+    
+    # Add detailed module information with health scores and levels
+    structured_prompt+="Module Details:\n"
+    for key in "${!detailed_report[@]}"; do
+        structured_prompt+="- $key:\n"
+        structured_prompt+="  - Status: ${detailed_report[$key]}\n"
+        # Extract health score and level if available (assuming modules store this info)
+        if [[ ${detailed_report[$key]} =~ Health[[:space:]]+Level:[[:space:]]*([A-Z]+)[[:space:]]+Score:[[:space:]]*([0-9]+) ]]; then
+            local level=${BASH_REMATCH[1]}
+            local score=${BASH_REMATCH[2]}
+            structured_prompt+="  - Health Level: $level\n"
+            structured_prompt+="  - Score: $score/100\n"
+        fi
+    done
+    
+    structured_prompt+="\nPlease provide actionable recommendations based on the scores and status of each module."
+    
     # Use jq to create a properly formatted JSON payload
     jq -n \
-        --arg prompt "$prompt" \
+        --arg prompt "$structured_prompt" \
         --arg max_length "$AI_MAX_LENGTH" \
         '{
             "inputs": $prompt,
@@ -867,6 +932,8 @@ check_myvestacp_services() {
     
     local current_high_issues=0
     local current_medium_issues=0
+    local current_low_issues=0
+    local health_score=100
 
     # Group services by category for better organization
     local web_services=("apache2" "nginx")
@@ -898,8 +965,10 @@ check_myvestacp_services() {
                       "$service" == "clamav-daemon" || "$service" == "clamav-freshclam" || \
                       "$service" == "mariadb" || "$service" == "cron" || "$service" == "ssh" ]]; then
                     ((current_high_issues++))
+                    health_score=$((health_score - 10))  # Critical service down: -10 points
                 else
                     ((current_medium_issues++))
+                    health_score=$((health_score - 5))   # Non-critical service down: -5 points
                 fi
             fi
         done
@@ -911,6 +980,37 @@ check_myvestacp_services() {
     print_category "Mail Services" "${mail_services[@]}"
     print_category "Security Services" "${security_services[@]}"
     print_category "System Services" "${system_services[@]}"
+
+    # Ensure score doesn't go below 0
+    if [ $health_score -lt 0 ]; then
+        health_score=0
+    fi
+
+    # Determine health level based on score
+    local health_level="EXCELLENT"
+    if [ $health_score -le 95 ] && [ $health_score -gt 85 ]; then
+        health_level="GOOD"
+    elif [ $health_score -le 85 ] && [ $health_score -gt 65 ]; then
+        health_level="FAIR"
+    elif [ $health_score -le 65 ] && [ $health_score -gt 35 ]; then
+        health_level="POOR"
+    elif [ $health_score -le 35 ]; then
+        health_level="CRITICAL"
+    fi
+
+    # Display health summary
+    if [ $health_score -eq 100 ]; then
+        printf "\n%b\n" "${GREEN}Health Level: $health_level (Score: $health_score/100)${NC}"
+        printf "%b\n" "${GREEN}✓ All MyVestaCP services running normally${NC}"
+    else
+        printf "\n%b\n" "${YELLOW}Health Level: $health_level (Score: $health_score/100)${NC}"
+        if [ $current_high_issues -gt 0 ]; then
+            printf "%b\n" "${RED}⚠️  Critical issues: $current_high_issues critical service(s) not running${NC}"
+        fi
+        if [ $current_medium_issues -gt 0 ]; then
+            printf "%b\n" "${YELLOW}⚠️  Medium issues: $current_medium_issues service(s) not running${NC}"
+        fi
+    fi
 
     ((high_issues+=current_high_issues))
     ((medium_issues+=current_medium_issues))
@@ -1222,10 +1322,10 @@ check_email_status() {
         # Calculate and show delivery success rate
         if [ "$total_attempts" -gt 0 ]; then
             local success_rate=$(( (delivered_count * 100) / total_attempts ))
-            if [ "$success_rate" -lt 70 ]; then
+            if [ "$success_rate" -lt 50 ]; then
                 output+=("${RED}Delivery success rate: ${success_rate}% ⚠️  Low${NC}")
                 recent_failures=$((recent_failures + 5))
-            elif [ "$success_rate" -lt 90 ]; then
+            elif [ "$success_rate" -lt 75 ]; then
                 output+=("${YELLOW}Delivery success rate: ${success_rate}% ⚠️  Moderate${NC}")
                 recent_failures=$((recent_failures + 2))
             else
@@ -1283,11 +1383,11 @@ check_email_status() {
     
     # Factor 3: Delivery failures (20% weight) - Email delivery effectiveness
     local failure_factor=0
-    if [ "$recent_failures" -gt 20 ]; then
-        failure_factor=20  # High - many recent failures
+    if [ "$recent_failures" -gt 50 ]; then
+        failure_factor=20  # High - many recent failures (was 20)
         factor_explanations+=("High recent failures: +20 points (${recent_failures} failures)")
-    elif [ "$recent_failures" -gt 10 ]; then
-        failure_factor=10  # Medium - some recent failures
+    elif [ "$recent_failures" -gt 30 ]; then
+        failure_factor=10  # Medium - some recent failures (was 10)
         factor_explanations+=("Recent failures: +10 points (${recent_failures} failures)")
     fi
     threat_score=$((threat_score + failure_factor))
@@ -1301,32 +1401,33 @@ check_email_status() {
     threat_score=$((threat_score + config_factor))
     
     # Factor 5: Authentication problems (10% weight) - Security concerns
+    # NOTE: Auth failures are often brute force attempts (normal for mail servers)
     local auth_factor=0
-    if [ "$auth_failures" -gt 10 ]; then
-        auth_factor=10  # High auth failures
-        factor_explanations+=("High auth failures: +10 points (${auth_failures} failures)")
-    elif [ "$auth_failures" -gt 5 ]; then
-        auth_factor=5  # Some auth failures
-        factor_explanations+=("Auth failures: +5 points (${auth_failures} failures)")
+    if [ "$auth_failures" -gt 500 ]; then
+        auth_factor=10  # Very high auth failures (was 10)
+        factor_explanations+=("Very high auth failures: +10 points (${auth_failures} failures)")
+    elif [ "$auth_failures" -gt 200 ]; then
+        auth_factor=5  # High auth failures (was 5)
+        factor_explanations+=("High auth failures: +5 points (${auth_failures} failures)")
     fi
     threat_score=$((threat_score + auth_factor))
     
     # Convert threat score to health score (inverse: 100 - threat_score)
     local health_score=$((100 - threat_score))
     
-    # Determine health level based on health score (now intuitive)
+    # Determine health level based on health score (EXIM4)
     local email_health_level=""
     local health_color=""
-    if [ "$health_score" -ge 90 ]; then
+    if [ "$health_score" -eq 100 ]; then
         email_health_level="EXCELLENT"
         health_color="${GREEN}"
-    elif [ "$health_score" -ge 75 ]; then
+    elif [ "$health_score" -ge 90 ]; then
         email_health_level="GOOD"
         health_color="${GREEN}"
-    elif [ "$health_score" -ge 50 ]; then
+    elif [ "$health_score" -ge 75 ]; then
         email_health_level="FAIR"
         health_color="${YELLOW}"
-    elif [ "$health_score" -ge 25 ]; then
+    elif [ "$health_score" -ge 50 ]; then
         email_health_level="POOR"
         health_color="${YELLOW}"
     else
@@ -1349,7 +1450,6 @@ check_email_status() {
     
     # Display health assessment
     output+=("")
-    output+=("${BLUE}=== Intelligent Health Assessment ===${NC}")
     output+=("${health_color}Health Level: $email_health_level (Score: ${health_score}/100)${NC}")
     
     
@@ -1435,6 +1535,14 @@ check_ssl_status() {
     local current_medium_issues=0
     local current_low_issues=0
     
+    # Initialize SSL scoring components
+    local total_certificates=0
+    local valid_certificates=0
+    local expired_certificates=0
+    local verification_failures=0
+    local renewal_errors=0
+    local connectivity_issues=0
+    
     echo -e "Processing SSL certificates... This may take a few moments."
     
     # Check Let's Encrypt Status first
@@ -1448,12 +1556,14 @@ check_ssl_status() {
                     echo -e "  - $line"
                 fi
             done
+            ((renewal_errors++))
             ((current_medium_issues++))
         else
             echo -e "${GREEN}✓ No recent errors${NC}"
         fi
     else
         echo -e "${YELLOW}⚠️  Log file not found${NC}"
+        ((renewal_errors++))
     fi
     
     # Function to check certificate expiration with timeout
@@ -1482,59 +1592,66 @@ check_ssl_status() {
     # Get all users and their domains with timeout
     local users_list=$(run_with_timeout 30 "v-list-users 2>/dev/null")
     if [ $? -eq 0 ] && [ -n "$users_list" ]; then
-        echo "$users_list" | while IFS= read -r line; do
+        while IFS= read -r line; do
             if [[ $line =~ ^[A-Za-z0-9_]+[[:space:]]+.* ]] && [[ "$line" != "USER "* ]]; then
                 local user=$(echo "$line" | awk '{print $1}')
                 
                 local domains_list=$(run_with_timeout 30 "v-list-web-domains $user 2>/dev/null")
                 if [ $? -eq 0 ] && [ -n "$domains_list" ]; then
-                    echo "$domains_list" | grep -v "^---" | grep -v "^DOMAIN" | while IFS= read -r domain_line; do
-                        if [ -n "$domain_line" ]; then
+                    while IFS= read -r domain_line; do
+                        if [ -n "$domain_line" ] && [[ ! "$domain_line" =~ ^(---|DOMAIN) ]]; then
                             local domain=$(echo "$domain_line" | awk '{print $1}')
                             
                             if [ -n "$domain" ] && [ "$domain" != "------" ] && [ "$domain" != "DOMAIN" ]; then
+                                ((total_certificates++))
+                                
                                 if run_with_timeout 5 "host $domain >/dev/null 2>&1"; then
                                     local days_left=$(check_cert_expiration "$domain")
                                     # Check if days_left is a number before making numeric comparisons
                                     if [ -n "$days_left" ] && [[ "$days_left" =~ ^-?[0-9]+$ ]]; then
                                         if [ "$days_left" -gt 0 ]; then
-                                            if [ "$days_left" -le 7 ]; then
-                                                echo -e "${RED}⚠️  $domain expires in $days_left days${NC}"
+                                            ((valid_certificates++))
+                                            if [ "$days_left" -le 3 ]; then
+                                                echo -e "${RED}⚠️  $domain expires in $days_left days (renewal needed)${NC}"
                                                 ((needs_renewal++))
-                                                ((current_high_issues++))  # ≤7 days = CRITICAL
-                                            elif [ "$days_left" -le 15 ]; then
-                                                echo -e "${YELLOW}⚠️  $domain expires in $days_left days${NC}"
+                                                ((current_high_issues++))  # ≤3 days = CRITICAL issue
+                                            elif [ "$days_left" -le 7 ]; then
+                                                echo -e "${YELLOW}⚠️  $domain expires in $days_left days (monitor closely)${NC}"
                                                 ((needs_renewal++))
-                                                ((current_medium_issues++))  # 8-15 days = MEDIUM
-                                            elif [ "$days_left" -le 30 ]; then
-                                                echo -e "${YELLOW}⚠️  $domain expires in $days_left days${NC}"
-                                                ((needs_renewal++))
-                                                ((current_low_issues++))  # 16-30 days = LOW
+                                                ((current_medium_issues++))  # 4-7 days = MEDIUM issue
                                             else
                                                 echo -e "${GREEN}✓ $domain valid for $days_left days${NC}"
                                             fi
-                                        elif [ -n "$days_left" ] && [[ "$days_left" =~ ^-?[0-9]+$ ]] && [ "$days_left" -eq 0 ]; then
+                                        elif [ "$days_left" -eq 0 ]; then
                                             echo -e "${RED}⚠️  $domain SSL certificate has expired today${NC}"
+                                            ((expired_certificates++))
                                             ((current_high_issues++))
                                             ((needs_renewal++))
                                         else
-                                            echo -e "${YELLOW}⚠️  Could not get SSL certificate info for $domain or check failed${NC}"
-                                            ((current_medium_issues++))
+                                            echo -e "${RED}⚠️  $domain SSL certificate expired $((days_left * -1)) days ago${NC}"
+                                            ((expired_certificates++))
+                                            ((current_high_issues++))
+                                            ((needs_renewal++))
                                         fi
+                                    else
+                                        echo -e "${YELLOW}⚠️  Could not verify SSL certificate for $domain${NC}"
+                                        ((verification_failures++))
+                                            ((current_medium_issues++))
                                     fi
                                 else
-                                    echo -e "${YELLOW}⚠️  Could not resolve domain $domain to check SSL${NC}"
+                                    echo -e "${YELLOW}⚠️  Could not resolve domain $domain (DNS issue)${NC}"
+                                    ((connectivity_issues++))
                                     ((current_medium_issues++))
                                 fi
                             fi
                         fi
-                    done
+                    done <<< "$domains_list"
                 else
                     echo -e "${RED}⚠️  Could not list web domains for user $user${NC}"
                     ((current_medium_issues++))
                 fi
             fi
-        done
+        done <<< "$users_list"
     else
         echo -e "${RED}⚠️  Could not list users${NC}"
         ((current_medium_issues++))
@@ -1543,54 +1660,125 @@ check_ssl_status() {
     # Check Vesta Control Panel SSL
     local vesta_domain=$(run_with_timeout 5 "hostname -f")
     if [ $? -eq 0 ] && [ -n "$vesta_domain" ]; then
+        ((total_certificates++))
          if run_with_timeout 5 "host $vesta_domain >/dev/null 2>&1"; then
             local days_left=$(check_cert_expiration "$vesta_domain")
             # Check if days_left is a number before making numeric comparisons
             if [ -n "$days_left" ] && [[ "$days_left" =~ ^-?[0-9]+$ ]]; then
                 if [ "$days_left" -gt 0 ]; then
-                    if [ "$days_left" -le 7 ]; then
+                    ((valid_certificates++))
+                    if [ "$days_left" -le 3 ]; then
                         echo -e "${RED}⚠️  Vesta Control Panel ($vesta_domain) expires in $days_left days${NC}"
                         ((needs_renewal++))
-                        ((current_high_issues++))  # ≤7 days = CRITICAL
-                    elif [ "$days_left" -le 15 ]; then
+                        ((current_high_issues++))  # ≤3 days = CRITICAL
+                    elif [ "$days_left" -le 7 ]; then
                         echo -e "${YELLOW}⚠️  Vesta Control Panel ($vesta_domain) expires in $days_left days${NC}"
                         ((needs_renewal++))
-                        ((current_medium_issues++))  # 8-15 days = MEDIUM
-                    elif [ "$days_left" -le 30 ]; then
-                        echo -e "${YELLOW}⚠️  Vesta Control Panel ($vesta_domain) expires in $days_left days${NC}"
-                        ((needs_renewal++))
-                        ((current_low_issues++))  # 16-30 days = LOW
+                        ((current_medium_issues++))  # 4-7 days = MEDIUM
                     else
                         echo -e "${GREEN}✓ Vesta Control Panel ($vesta_domain) valid for $days_left days${NC}"
                     fi
-                elif [ -n "$days_left" ] && [[ "$days_left" =~ ^-?[0-9]+$ ]] && [ "$days_left" -eq 0 ]; then
+                elif [ "$days_left" -eq 0 ]; then
                      echo -e "${RED}⚠️  Vesta Control Panel ($vesta_domain) SSL certificate has expired today${NC}"
-                     ((current_high_issues++)) # Expired Vesta certificate is a critical issue
+                    ((expired_certificates++))
+                    ((current_high_issues++))
                      ((needs_renewal++))
                 else
-                    echo -e "${YELLOW}⚠️  Could not get Vesta Control Panel SSL certificate info or check failed${NC}"
-                    ((current_medium_issues++)) # Failure to get Vesta info is a medium issue
+                    echo -e "${RED}⚠️  Vesta Control Panel ($vesta_domain) SSL certificate expired $((days_left * -1)) days ago${NC}"
+                    ((expired_certificates++))
+                    ((current_high_issues++))
+                    ((needs_renewal++))
                 fi
+            else
+                echo -e "${YELLOW}⚠️  Could not verify Vesta Control Panel SSL certificate${NC}"
+                ((verification_failures++))
+                ((current_medium_issues++))
             fi
          else
-             echo -e "${YELLOW}⚠️  Could not resolve Vesta Control Panel domain $vesta_domain to check SSL${NC}"
-             ((current_medium_issues++)) # Failure to resolve Vesta domain is a medium issue
+            echo -e "${YELLOW}⚠️  Could not resolve Vesta Control Panel domain $vesta_domain${NC}"
+            ((connectivity_issues++))
+            ((current_medium_issues++))
          fi
     else
         echo -e "${RED}⚠️  Could not determine Vesta Control Panel domain${NC}"
-        ((current_medium_issues++)) # Failure to determine Vesta domain is a medium issue
+        ((current_medium_issues++))
     fi
 
-    # Summary at the end
-    if [ -n "$needs_renewal" ] && [[ "$needs_renewal" =~ ^[0-9]+$ ]] && [ "$needs_renewal" -eq 0 ]; then
-        ssl_status="${GREEN}✓ All SSL certificates are valid${NC}"
-    else
-        if [ -z "$needs_renewal" ] || ! [[ "$needs_renewal" =~ ^[0-9]+$ ]]; then
-             ssl_status="${YELLOW}⚠️  Could not determine renewal needs status${NC}"
+    # Calculate SSL Health Score (0-100) - Only penalize real problems
+    local health_score=100
+    
+    # Penalties for real problems only
+    health_score=$((health_score - (expired_certificates * 30)))        # -30 per expired cert
+    health_score=$((health_score - (verification_failures * 10)))      # -10 per verification failure
+    health_score=$((health_score - (connectivity_issues * 5)))          # -5 per DNS/connectivity issue
+    health_score=$((health_score - (renewal_errors * 15)))              # -15 per renewal error
+    
+    # Additional penalties for certificates expiring within 3 days (renewal failure)
+    if [ "$current_high_issues" -gt 0 ]; then
+        health_score=$((health_score - (current_high_issues * 20)))     # -20 per cert expiring ≤3 days
+    fi
+    
+    # Ensure score doesn't go below 0
+    if [ "$health_score" -lt 0 ]; then
+        health_score=0
+    fi
+    
+    # Determine health level
+    local ssl_health_level=""
+    local health_color=""
+    if [ "$health_score" -ge 95 ]; then
+        ssl_health_level="EXCELLENT"
+        health_color="${GREEN}"
+    elif [ "$health_score" -ge 85 ]; then
+        ssl_health_level="GOOD"
+        health_color="${GREEN}"
+    elif [ "$health_score" -ge 65 ]; then
+        ssl_health_level="FAIR"
+        health_color="${YELLOW}"
              ((current_medium_issues++))
-        elif [ "$needs_renewal" -gt 0 ]; then
-             ssl_status="${RED}⚠️  $needs_renewal certificates need renewal soon${NC}"
+    elif [ "$health_score" -ge 35 ]; then
+        ssl_health_level="POOR"
+        health_color="${YELLOW}"
+        ((current_high_issues++))
+    else
+        ssl_health_level="CRITICAL"
+        health_color="${RED}"
+        ((current_high_issues++))
+    fi
+    
+    # Display Health Assessment
+    echo -e "\n${health_color}Health Level: $ssl_health_level (Score: ${health_score}/100)${NC}"
+    
+    # Display summary
+    if [ "$total_certificates" -gt 0 ]; then
+        echo -e "✓ $total_certificates SSL certificates analyzed"
+        if [ "$valid_certificates" -eq "$total_certificates" ] && [ "$expired_certificates" -eq 0 ] && [ "$verification_failures" -eq 0 ]; then
+            echo -e "✓ All certificates valid and verified successfully"
+            if [ "$needs_renewal" -eq 0 ]; then
+                echo -e "✓ No certificates requiring immediate attention"
+            fi
+        else
+            if [ "$expired_certificates" -gt 0 ]; then
+                echo -e "${RED}⚠️  $expired_certificates expired certificate(s)${NC}"
+            fi
+            if [ "$verification_failures" -gt 0 ]; then
+                echo -e "${YELLOW}⚠️  $verification_failures verification failure(s)${NC}"
+            fi
+            if [ "$connectivity_issues" -gt 0 ]; then
+                echo -e "${YELLOW}⚠️  $connectivity_issues connectivity issue(s)${NC}"
+            fi
         fi
+    fi
+
+    # Summary status - simplified
+    if [ "$expired_certificates" -eq 0 ] && [ "$verification_failures" -eq 0 ] && [ "$needs_renewal" -eq 0 ]; then
+        ssl_status="${GREEN}✓ All SSL certificates are valid${NC}"
+    elif [ "$expired_certificates" -gt 0 ]; then
+        ssl_status="${RED}⚠️  $expired_certificates certificate(s) expired${NC}"
+    elif [ "$needs_renewal" -gt 0 ]; then
+        ssl_status="${YELLOW}⚠️  $needs_renewal certificate(s) need attention${NC}"
+    else
+        ssl_status="${YELLOW}⚠️  SSL verification issues detected${NC}"
     fi
     
     echo -e "\n$ssl_status"
@@ -1598,20 +1786,29 @@ check_ssl_status() {
     # Track which modules have issues and capture detailed info for AI analysis
     local ssl_details=""
     if [ $current_high_issues -gt 0 ]; then
+        if [ "$ssl_health_level" = "CRITICAL" ]; then
         critical_modules_found+=("SSL")
-        ssl_details="Critical SSL issues: Certificates expiring within 7 days or already expired"
+        else
+            high_modules_found+=("SSL")
+        fi
+        
+        if [ "$expired_certificates" -gt 0 ]; then
+            ssl_details="Health Level: $ssl_health_level (Score: ${health_score}/100) - SSL critical issues: $expired_certificates expired certificate(s) detected - immediate renewal required"
+        else
+            ssl_details="Health Level: $ssl_health_level (Score: ${health_score}/100) - SSL issues requiring attention: certificates expiring within 3 days or renewal failures"
+        fi
     elif [ $current_medium_issues -gt 0 ]; then
         medium_modules_found+=("SSL")
-        if [ -n "$needs_renewal" ] && [[ "$needs_renewal" =~ ^[0-9]+$ ]] && [ "$needs_renewal" -gt 0 ]; then
-            ssl_details="SSL certificates requiring attention: $needs_renewal certificate(s) expiring within 8-15 days"
+        if [ "$verification_failures" -gt 0 ] || [ "$connectivity_issues" -gt 0 ]; then
+            ssl_details="Health Level: $ssl_health_level (Score: ${health_score}/100) - SSL monitoring needed: verification or connectivity issues detected"
         else
-            ssl_details="SSL configuration issues detected"
+            ssl_details="Health Level: $ssl_health_level (Score: ${health_score}/100) - SSL certificates need monitoring: some expiring within 7 days"
         fi
     elif [ $current_low_issues -gt 0 ]; then
         low_modules_found+=("SSL")
-        ssl_details="SSL certificates need monitoring: $needs_renewal certificate(s) expiring within 16-30 days"
+        ssl_details="Health Level: $ssl_health_level (Score: ${health_score}/100) - SSL minor issues: non-critical warnings detected"
     else
-        ssl_details="All SSL certificates are valid and properly configured"
+        ssl_details="Health Level: $ssl_health_level (Score: ${health_score}/100) - SSL certificates functioning optimally: $total_certificates certificate(s) valid and properly configured with automatic renewal working"
     fi
     
     detailed_report["ssl"]="$ssl_details"
@@ -1699,10 +1896,26 @@ check_php_status() {
             echo -e "${GREEN}✓ Service running${NC}"
             ((running_services++))
             
-            # Get process info
+            # Get process info - use systemctl status to get active/idle info
+            local status_output=$(systemctl status "$service_name" 2>/dev/null | grep "Status:")
+            if [ -n "$status_output" ]; then
+                # Extract active and idle process counts from status line
+                local active_processes=$(echo "$status_output" | grep -o "active: [0-9]*" | grep -o "[0-9]*")
+                local idle_processes=$(echo "$status_output" | grep -o "idle: [0-9]*" | grep -o "[0-9]*")
+                local total_processes=$((${active_processes:-0} + ${idle_processes:-0}))
+                
+                if [ "$total_processes" -gt 0 ]; then
+                    echo -e "  * Active processes: ${active_processes:-0}"
+                    if [ "${idle_processes:-0}" -gt 0 ]; then
+                        echo -e "  * Idle processes: ${idle_processes:-0}"
+                    fi
+                fi
+            else
+                # Fallback to process count if systemctl status doesn't provide info
             local process_count=$(pgrep -c "php-fpm.*${version}" 2>/dev/null || echo "0")
             if [ "$process_count" -gt 0 ]; then
-                echo -e "  * Active processes: $process_count"
+                    echo -e "  * Total processes: $process_count"
+                fi
             fi
         else
             echo -e "${RED}⚠️  Service not running (status: $service_status)${NC}"
@@ -1731,7 +1944,7 @@ check_php_status() {
             fi
             
             # Show key configuration details
-            local max_children=$(grep -r "pm.max_children" "/etc/php/${version}/fpm/pool.d/" 2>/dev/null | head -1 | awk '{print $NF}' | tr -d '\n' || echo "Unknown")
+            local max_children=$(grep -r "pm\.max_children" "/etc/php/${version}/fpm/pool.d/" 2>/dev/null | head -1 | awk '{print $3}' | tr -d '\n' || echo "Unknown")
             local process_manager=$(grep -r "^pm =" "/etc/php/${version}/fpm/pool.d/" 2>/dev/null | head -1 | awk '{print $3}' | tr -d '\n' || echo "Unknown")
             
             if [ "$max_children" != "Unknown" ]; then
@@ -1745,13 +1958,13 @@ check_php_status() {
         
         # 3. PERFORMANCE METRICS (20% weight) - Memory and resource usage
         if [ "$service_status" = "active" ]; then
-            # Check memory usage of PHP-FPM processes
-            local memory_usage=$(ps -o pid,rss,comm -C "php-fpm${version}" --no-headers 2>/dev/null | awk '{sum += $2} END {print sum/1024}' | cut -d. -f1)
-            if [ -n "$memory_usage" ] && [ "$memory_usage" -gt 0 ]; then
+            # Check memory usage of PHP-FPM processes - improved calculation
+            local memory_usage=$(ps -o rss -C "php-fpm${version}" --no-headers 2>/dev/null | awk '{sum += $1} END {printf "%.0f", sum/1024}')
+            if [ -n "$memory_usage" ] && [ "$memory_usage" -gt 0 ] 2>/dev/null; then
                 echo -e "  * Memory usage: ${memory_usage}MB"
                 
                 # Check if memory usage is concerning (>500MB per version)
-                if [ "$memory_usage" -gt 500 ]; then
+                if [ "$memory_usage" -gt 500 ] 2>/dev/null; then
                     echo -e "${YELLOW}    (High memory usage)${NC}"
                     ((performance_issues++))
                 fi
@@ -1768,26 +1981,126 @@ check_php_status() {
             fi
         fi
         
-        # 4. CRITICAL LOG ANALYSIS (15% weight) - Only check for critical issues
+        # 4. ENHANCED LOG ANALYSIS (15% weight) - Check for various severities
         local log_file="/var/log/php${version}-fpm.log"
         if [ -f "$log_file" ]; then
-            # Only check today's critical errors (much faster than full log analysis)
+            # Check today's logs with different severity levels
             local today=$(date "+%d-%b-%Y")
+            
+            # Critical errors (will trigger high issues)
             local critical_errors=$(grep -c "$today.*\(FATAL\|Out of memory\|zombie\|segmentation fault\)" "$log_file" 2>/dev/null || echo "0")
             
-            # Ensure critical_errors is a valid integer
+            # Warning issues (will trigger medium issues)
+            local warning_issues=$(grep -c "$today.*WARNING.*\(max_children\|server reached\|pool .* server reached\)" "$log_file" 2>/dev/null || echo "0")
+            
+            # General warnings and errors (will trigger low issues) 
+            local general_warnings=$(grep -c "$today.*\(WARNING\|ERROR\)" "$log_file" 2>/dev/null || echo "0")
+            
+            # Ensure all counts are valid integers first
             critical_errors=${critical_errors:-0}
             critical_errors=$(echo "$critical_errors" | tr -d ' \n' | grep -o '^[0-9]*' || echo "0")
+            warning_issues=${warning_issues:-0}
+            warning_issues=$(echo "$warning_issues" | tr -d ' \n' | grep -o '^[0-9]*' || echo "0")
+            general_warnings=${general_warnings:-0}
+            general_warnings=$(echo "$general_warnings" | tr -d ' \n' | grep -o '^[0-9]*' || echo "0")
             
+            # Subtract specific warnings from general count (with safety check)
+            if [ "$general_warnings" -ge "$warning_issues" ] 2>/dev/null; then
+                general_warnings=$((general_warnings - warning_issues))
+            else
+                general_warnings=0
+            fi
+            
+            # Report findings
             if [ "$critical_errors" -gt 0 ] 2>/dev/null; then
                 echo -e "${RED}⚠️  Critical errors today: $critical_errors${NC}"
-                # Show last critical error
                 local last_error=$(grep "$today.*\(FATAL\|Out of memory\|zombie\|segmentation fault\)" "$log_file" 2>/dev/null | tail -1)
                 if [ -n "$last_error" ]; then
                     echo -e "  * Last: $(echo "$last_error" | cut -c1-80)..."
                 fi
                 ((critical_log_issues++))
-                        ((current_high_issues++))
+                ((current_high_issues++))
+                
+                # Add to email details
+                DETAILED_ISSUES_EMAIL+="<h3 style='color: #dc3545;'>🐘 PHP $version - Critical Errors ($critical_errors)</h3>"
+                DETAILED_ISSUES_EMAIL+="<ul style='margin: 10px 0; padding-left: 20px;'>"
+                if [ -n "$last_error" ]; then
+                    local clean_msg=$(echo "$last_error" | sed 's/^\[[^]]*\] //')
+                    DETAILED_ISSUES_EMAIL+="<li>Last: $clean_msg</li>"
+                fi
+                DETAILED_ISSUES_EMAIL+="</ul>"
+            elif [ "$warning_issues" -gt 0 ] 2>/dev/null; then
+                echo -e "${YELLOW}⚠️  Performance warnings today: $warning_issues${NC}"
+                
+                # Show all warnings instead of just the last one
+                local all_warnings=$(grep "$today.*WARNING.*\(max_children\|server reached\|pool .* server reached\)" "$log_file" 2>/dev/null)
+                if [ -n "$all_warnings" ]; then
+                    local warning_count=0
+                    while IFS= read -r warning_line; do
+                        if [ -n "$warning_line" ]; then
+                            ((warning_count++))
+                            if [ "$warning_count" -le 3 ]; then  # Show up to 3 warnings to avoid spam
+                                # Extract time and pool name for cleaner display
+                                local warning_time=$(echo "$warning_line" | grep -o '\[[0-9][0-9]-[A-Za-z]*-[0-9]* [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\]')
+                                local pool_name=$(echo "$warning_line" | grep -o '\[pool [^]]*\]' | sed 's/\[pool \(.*\)\]/\1/')
+                                local warning_msg=$(echo "$warning_line" | sed 's/.*WARNING: //' | sed 's/\[pool [^]]*\] //')
+                                
+                                if [ -n "$warning_time" ] && [ -n "$pool_name" ] && [ -n "$warning_msg" ]; then
+                                    echo -e "  * ${warning_time} Pool: ${pool_name} - ${warning_msg}"
+                                else
+                                    # Fallback to showing truncated full line
+                                    echo -e "  * $(echo "$warning_line" | cut -c1-80)..."
+                                fi
+                            elif [ "$warning_count" -eq 4 ]; then
+                                echo -e "  * ... and $((warning_issues - 3)) more warning(s)"
+                                break
+                            fi
+                        fi
+                    done <<< "$all_warnings"
+                fi
+                ((performance_issues++))
+                ((current_medium_issues++))
+                
+                # Add to email details
+                DETAILED_ISSUES_EMAIL+="<h3 style='color: #fd7e14;'>🐘 PHP $version - Performance Warnings ($warning_issues)</h3>"
+                DETAILED_ISSUES_EMAIL+="<ul style='margin: 10px 0; padding-left: 20px;'>"
+                if [ -n "$all_warnings" ]; then
+                    local warning_count=0
+                    while IFS= read -r warning_line; do
+                        if [ -n "$warning_line" ]; then
+                            ((warning_count++))
+                            if [ "$warning_count" -le 3 ]; then
+                                local warning_time=$(echo "$warning_line" | grep -o '\[[0-9][0-9]-[A-Za-z]*-[0-9]* [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\]')
+                                local pool_name=$(echo "$warning_line" | grep -o '\[pool [^]]*\]' | sed 's/\[pool \(.*\)\]/\1/')
+                                local warning_msg=$(echo "$warning_line" | sed 's/.*WARNING: //' | sed 's/\[pool [^]]*\] //')
+                                
+                                if [ -n "$warning_time" ] && [ -n "$pool_name" ] && [ -n "$warning_msg" ]; then
+                                    DETAILED_ISSUES_EMAIL+="<li>${warning_time} Pool: ${pool_name} - ${warning_msg}</li>"
+                                else
+                                    local clean_msg=$(echo "$warning_line" | sed 's/^\[[^]]*\] //')
+                                    DETAILED_ISSUES_EMAIL+="<li>$clean_msg</li>"
+                                fi
+                            elif [ "$warning_count" -eq 4 ]; then
+                                DETAILED_ISSUES_EMAIL+="<li>... and $((warning_issues - 3)) more warning(s)</li>"
+                                break
+                            fi
+                        fi
+                    done <<< "$all_warnings"
+                fi
+                DETAILED_ISSUES_EMAIL+="</ul>"
+            elif [ "$general_warnings" -gt 0 ] 2>/dev/null; then
+                echo -e "${YELLOW}⚠️  General warnings today: $general_warnings${NC}"
+                ((current_low_issues++))
+                
+                # Add to email details
+                DETAILED_ISSUES_EMAIL+="<h3 style='color: #fd7e14;'>🐘 PHP $version - General Warnings ($general_warnings)</h3>"
+                DETAILED_ISSUES_EMAIL+="<ul style='margin: 10px 0; padding-left: 20px;'>"
+                local last_warning=$(grep "$today.*\(WARNING\|ERROR\)" "$log_file" 2>/dev/null | tail -1)
+                if [ -n "$last_warning" ]; then
+                    local clean_msg=$(echo "$last_warning" | sed 's/^\[[^]]*\] //')
+                    DETAILED_ISSUES_EMAIL+="<li>Last: $clean_msg</li>"
+                fi
+                DETAILED_ISSUES_EMAIL+="</ul>"
             else
                 echo -e "${GREEN}✓ No critical issues today${NC}"
             fi
@@ -1859,7 +2172,6 @@ check_php_status() {
     fi
     
     # Display Health Assessment
-    echo -e "${BLUE}=== Intelligent Health Assessment ===${NC}"
     echo -e "${health_color}Health Level: $php_health_level (Score: ${health_score}/100)${NC}"
     
     # Show summary
@@ -2091,64 +2403,159 @@ check_mysql_status() {
     
     # 5. SELECTIVE LOG ANALYSIS (Only if issues detected) - Smart approach
     local critical_log_issues=0
-    if [ "$current_high_issues" -gt 0 ] || [ "$current_medium_issues" -gt 0 ]; then
-        echo -e "\n${YELLOW}Analyzing logs for additional context...${NC}"
+    echo -e "
+${YELLOW}Analyzing logs for additional context...${NC}"
         
         local log_file=""
         if [ -f "/var/log/mysql/error.log" ]; then
             log_file="/var/log/mysql/error.log"
         elif [ -f "/var/log/mariadb/mariadb.log" ]; then
             log_file="/var/log/mariadb/mariadb.log"
-        elif [ -f "/var/log/mysqld.log" ]; then
-            log_file="/var/log/mysqld.log"
+    fi
+    
+    if [ -n "$log_file" ]; then
+        # Get today's date in the exact format used in MySQL logs
+        local today_date=$(date '+%Y-%m-%d')
+        echo -e "${BLUE}Analyzing MySQL logs for today: $today_date${NC}"
+        
+        # Check for recent crashes or critical errors in logs
+        local direct_crashes=$(echo "$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep -c 'Server shutdown complete\|mysqld_safe.*restarted\|InnoDB.*crash\|Assertion.*failed\|SIGSEGV\|SIGABRT' || echo 0")" | grep -oE '[0-9]+$' | tail -n 1 || echo "0")
+        
+        # Also check for unexpected shutdowns (crash indicators)
+        local unexpected_shutdowns=$(echo "$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep -c 'shutdown.*unexpectedly\|killed by signal\|emergency shutdown\|forced shutdown\|abnormal shutdown' || echo 0")" | grep -oE '[0-9]+$' | tail -n 1 || echo "0")
+        
+        # Check for InnoDB recovery (indicates previous crash)
+        local recovery_events=$(echo "$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep -c 'InnoDB.*recovery\|crash recovery\|log sequence number.*recovery' || echo 0")" | grep -oE '[0-9]+$' | tail -n 1 || echo "0")
+        
+        # Count table corruption errors separately (not crashes)
+        local table_errors=$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep 'ERROR.*Table.*marked as crashed' | wc -l")
+        
+        # Count other critical errors (excluding table corruption)
+        local other_critical_errors=$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep 'ERROR' | grep -v 'Table.*marked as crashed' | wc -l")
+        
+        local total_crash_indicators=$((direct_crashes + unexpected_shutdowns + recovery_events))
+        local total_errors=$((table_errors + other_critical_errors))
+        
+        # Show crash information (only if there are real crashes)
+        if [ "$total_crash_indicators" -gt 0 ]; then
+            echo -e "${RED}⚠️  System crashes detected: $total_crash_indicators event(s) today${NC}"
+            if [ "$direct_crashes" -gt 0 ]; then
+                echo -e "${RED}   • Direct crashes/aborts: $direct_crashes${NC}"
+            fi
+            if [ "$unexpected_shutdowns" -gt 0 ]; then
+                echo -e "${RED}   • Unexpected shutdowns: $unexpected_shutdowns${NC}"
+            fi
+            if [ "$recovery_events" -gt 0 ]; then
+                echo -e "${RED}   • Recovery events: $recovery_events${NC}"
+            fi
+            ((current_high_issues++))
+            critical_log_issues=$((critical_log_issues + total_crash_indicators))
+        else
+            echo -e "${GREEN}✓ No system crashes detected today${NC}"
         fi
         
-        if [ -n "$log_file" ] && [ -f "$log_file" ]; then
-            # Only check today's critical errors (much faster)
-            local today=$(date "+%Y-%m-%d")
-            local critical_errors=$(grep -c "$today.*\(ERROR\|FATAL\|crashed\|Aborted\)" "$log_file" 2>/dev/null || echo "0")
+        # Show error summary (consolidate all errors in one section)
+        if [ "$total_errors" -gt 0 ]; then
+            echo -e "${YELLOW}⚠️  Database issues found: $total_errors error(s) today${NC}"
             
-            if [ "$critical_errors" -gt 0 ]; then
-                echo -e "${RED}⚠️  Critical errors today: $critical_errors${NC}"
-                # Show last critical error
-                local last_error=$(grep "$today.*\(ERROR\|FATAL\|crashed\|Aborted\)" "$log_file" 2>/dev/null | tail -1)
-                if [ -n "$last_error" ]; then
-                    echo -e "  * Last: $(echo "$last_error" | cut -c1-80)..."
+            # Show table corruption details
+            if [ "$table_errors" -gt 0 ]; then
+                echo -e "${YELLOW}   • Table corruption: $table_errors error(s)${NC}"
+                local total_affected_databases=0
+                local corrupted_tables=$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep 'ERROR.*Table.*marked as crashed' | grep -oE \"Table '[^']+\" | sed \"s/Table '//g\" | sed \"s/'//g\" | sed 's|.*\/||g' | sort -u")
+                if [ -n "$corrupted_tables" ]; then
+                    echo "$corrupted_tables" | while read table; do
+                        if [ -n "$table" ]; then
+                            local error_count=$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep 'ERROR.*Table.*marked as crashed' | grep -c \"Table '.*$table\"")
+                            local dbs=$(mysql -e "SELECT TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '$table';" 2>/dev/null | tail -n +2 | tr '\n' ', ' | sed 's/,$//')
+                            if [ -n "$dbs" ]; then
+                                local db_count=$(echo "$dbs" | tr ',' '\n' | wc -l)
+                                total_affected_databases=$((total_affected_databases + db_count))
+                                echo -e "${YELLOW}     - '$table' ($error_count times) → databases: $dbs${NC}"
+                            fi
+                        fi
+                    done
                 fi
-                ((critical_log_issues++))
-            else
-                echo -e "${GREEN}✓ No critical errors in today's logs${NC}"
+            fi
+            
+            # Show other critical errors
+            if [ "$other_critical_errors" -gt 0 ]; then
+                echo -e "${YELLOW}   • Other critical errors: $other_critical_errors${NC}"
+                local sample_other=$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep 'ERROR' | grep -v 'Table.*marked as crashed' | head -2")
+                if [ -n "$sample_other" ]; then
+                    echo "$sample_other" | while read line; do
+                        if [ -n "$line" ]; then
+                            echo -e "${YELLOW}     - $(echo "$line" | cut -c1-80)...${NC}"
+                        fi
+                    done
+                fi
+            fi
+            
+            # Calculate total affected databases from all corrupted tables
+            local total_affected_databases=0
+            if [ "$table_errors" -gt 0 ]; then
+                local all_corrupted_tables=$(run_with_timeout 10 "grep '^$today_date' $log_file 2>/dev/null | grep 'ERROR.*Table.*marked as crashed' | grep -oE \"Table '[^']+\" | sed \"s/Table '//g\" | sed \"s/'//g\" | sed 's|.*\/||g' | sort -u")
+                if [ -n "$all_corrupted_tables" ]; then
+                    while read table; do
+                        if [ -n "$table" ]; then
+                            local dbs=$(mysql -e "SELECT TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '$table';" 2>/dev/null | tail -n +2)
+                            if [ -n "$dbs" ]; then
+                                local db_count=$(echo "$dbs" | wc -l)
+                                total_affected_databases=$((total_affected_databases + db_count))
+                            fi
+                        fi
+                    done <<< "$all_corrupted_tables"
+                fi
+            fi
+            
+            # Debug: Show affected databases count (remove this later)
+            echo -e "${BLUE}DEBUG: Total affected databases: $total_affected_databases${NC}"
+            
+            # More intelligent classification based on database impact
+            # NOTE: Database impact is already reflected in health_score calculation
+            # Removed duplicate medium_issues increment to avoid contradictory classifications
+            critical_log_issues=$((critical_log_issues + total_errors))
+        else
+            echo -e "${GREEN}✓ No database errors detected today${NC}"
         fi
     else
-            echo -e "${YELLOW}⚠️  Log file not found for detailed analysis${NC}"
-        fi
+        echo -e "${YELLOW}⚠️  Unable to check for recent crashes (log not found)${NC}"
+        ((current_low_issues++))
     fi
     
     # Calculate Health Score (0-100)
     local health_score=$(( (service_health * 35 + connection_health * 30 + performance_health * 20 + config_health * 15) / 100 ))
     
-    # Adjust for critical log issues
+    # Adjust for critical log issues (much more reasonable penalties)
     if [ "$critical_log_issues" -gt 0 ]; then
-        health_score=$(( health_score - (critical_log_issues * 10) ))
-        if [ "$health_score" -lt 0 ]; then
-            health_score=0
+        # For table errors (non-critical), apply lighter penalty
+        if echo "$error_details" | grep -q "Table.*marked as crashed\|Table.*corrupted"; then
+            # Corrupted tables are maintenance issues, not critical system failures
+            health_score=$(( health_score - 15 ))  # Fixed 15 point deduction regardless of count
+        else
+            # For other critical errors, apply moderate penalty
+            health_score=$(( health_score - (critical_log_issues * 2) ))  # 2 points per error instead of 10
+        fi
+        
+        if [ "$health_score" -lt 25 ]; then
+            health_score=25  # Never go below 25 if service is running well
         fi
     fi
     
     # Determine health level
     local mysql_health_level=""
     local health_color=""
-    if [ "$health_score" -ge 90 ]; then
+    if [ "$health_score" -eq 100 ]; then
         mysql_health_level="EXCELLENT"
         health_color="${GREEN}"
-    elif [ "$health_score" -ge 75 ]; then
+    elif [ "$health_score" -ge 90 ]; then
         mysql_health_level="GOOD"
         health_color="${GREEN}"
-    elif [ "$health_score" -ge 50 ]; then
+    elif [ "$health_score" -ge 75 ]; then
         mysql_health_level="FAIR"
         health_color="${YELLOW}"
         ((current_medium_issues++))
-    elif [ "$health_score" -ge 25 ]; then
+    elif [ "$health_score" -ge 50 ]; then
         mysql_health_level="POOR"
         health_color="${YELLOW}"
         ((current_high_issues++))
@@ -2159,7 +2566,6 @@ check_mysql_status() {
     fi
 
     # Display Health Assessment
-    echo -e "\n${BLUE}=== Intelligent Health Assessment ===${NC}"
     echo -e "${health_color}Health Level: $mysql_health_level (Score: ${health_score}/100)${NC}"
     
     # Show summary
@@ -2506,7 +2912,6 @@ check_clamav_status() {
     
     # Display health assessment
     output+=("")
-    output+=("${BLUE}=== Intelligent Health Assessment ===${NC}")
     output+=("${health_color}Health Level: $clamav_threat_level (Score: ${health_score}/100)${NC}")
     
     
@@ -3044,18 +3449,38 @@ check_fail2ban_status() {
         # Calculate patterns
         local attempts_per_ip=0
         if [ $unique_attacking_ips -gt 0 ]; then
-            attempts_per_ip=$((total_attempts_today / unique_attacking_ips))
+            attempts_per_ip=$(echo "scale=1; $total_attempts_today / $unique_attacking_ips" | bc 2>/dev/null || echo "$((total_attempts_today / unique_attacking_ips))")
         fi
         
         local bans_per_ip=0
         if [ $unique_banned_ips -gt 0 ]; then
-            bans_per_ip=$((total_bans_today / unique_banned_ips))
+            bans_per_ip=$(echo "scale=1; $total_bans_today / $unique_banned_ips" | bc 2>/dev/null || echo "$((total_bans_today / unique_banned_ips))")
         fi
         
-        # Intelligent threat categorization with multiple variables
-        current_high_issues=0
-        current_medium_issues=0
-        current_low_issues=0
+        # INTELLIGENT CONFIGURATION DETECTION
+        # Get maxretry configuration to understand protection level
+        local maxretry_ssh=$(fail2ban-client get ssh-iptables maxretry 2>/dev/null || echo "5")
+        local maxretry_exim=$(fail2ban-client get exim-iptables maxretry 2>/dev/null || echo "5") 
+        local maxretry_dovecot=$(fail2ban-client get dovecot-iptables maxretry 2>/dev/null || echo "5")
+        local avg_maxretry=$((($maxretry_ssh + $maxretry_exim + $maxretry_dovecot) / 3))
+        
+        # Calculate efficiency ratio (lower = better)
+        local efficiency_ratio=1
+        if [ $total_bans_today -gt 0 ] && command -v bc &> /dev/null; then
+            efficiency_ratio=$(echo "scale=2; $total_attempts_today / $total_bans_today" | bc 2>/dev/null || echo "1")
+        elif [ $total_bans_today -gt 0 ]; then
+            efficiency_ratio=$((total_attempts_today / total_bans_today + 1))
+        fi
+        
+        # Determine system type
+        local system_type="standard"
+        if [ $avg_maxretry -le 1 ]; then
+            system_type="proactive"
+        elif [ $avg_maxretry -le 3 ]; then
+            system_type="aggressive" 
+        else
+            system_type="standard"
+        fi
         
         # Calculate threat score based on multiple factors
         local threat_score=0
@@ -3091,14 +3516,29 @@ check_fail2ban_status() {
         fi
         
         # Factor 3: Intensity per attacker (weight: 20%)
-        if [ $attempts_per_ip -gt 2000 ]; then
+        # Use bc for decimal comparison if available, otherwise use integer comparison
+        if command -v bc &> /dev/null; then
+            if (( $(echo "$attempts_per_ip > 2000" | bc -l) )); then
             threat_score=$((threat_score + 20))
-        elif [ $attempts_per_ip -gt 1000 ]; then
+            elif (( $(echo "$attempts_per_ip > 1000" | bc -l) )); then
             threat_score=$((threat_score + 15))
-        elif [ $attempts_per_ip -gt 500 ]; then
+            elif (( $(echo "$attempts_per_ip > 500" | bc -l) )); then
             threat_score=$((threat_score + 10))
-        elif [ $attempts_per_ip -gt 200 ]; then
+            elif (( $(echo "$attempts_per_ip > 200" | bc -l) )); then
             threat_score=$((threat_score + 5))
+            fi
+        else
+            # Fallback to integer comparison
+            local attempts_per_ip_int=$(echo "$attempts_per_ip" | cut -d. -f1)
+            if [ ${attempts_per_ip_int:-0} -gt 2000 ]; then
+                threat_score=$((threat_score + 20))
+            elif [ ${attempts_per_ip_int:-0} -gt 1000 ]; then
+                threat_score=$((threat_score + 15))
+            elif [ ${attempts_per_ip_int:-0} -gt 500 ]; then
+                threat_score=$((threat_score + 10))
+            elif [ ${attempts_per_ip_int:-0} -gt 200 ]; then
+                threat_score=$((threat_score + 5))
+            fi
         fi
         
         # Factor 4: Current system load (weight: 15%)
@@ -3129,22 +3569,33 @@ check_fail2ban_status() {
         if [ $threat_score -ge 75 ]; then
             threat_level="CRITICAL"
             threat_color="${RED}"
-            current_high_issues=1
         elif [ $threat_score -ge 50 ]; then
-            threat_level="HIGH"
+            threat_level="POOR"
             threat_color="${RED}"
-            current_high_issues=1
         elif [ $threat_score -ge 25 ]; then
-            threat_level="MEDIUM"
+            threat_level="FAIR"
             threat_color="${YELLOW}"
-            current_medium_issues=1
         elif [ $threat_score -ge 10 ]; then
-            threat_level="LOW"
+            threat_level="GOOD"
             threat_color="${GREEN}"
-            current_low_issues=1
         else
-            threat_level="MINIMAL"
+            threat_level="EXCELLENT"
             threat_color="${GREEN}"
+        fi
+        
+        # INTELLIGENT ADJUSTMENT for Proactive Systems
+        if [ "$system_type" = "proactive" ] && [ $total_bans_today -gt 200 ]; then
+            # For proactive systems with high ban count, this indicates excellent protection
+            if command -v bc &> /dev/null && (( $(echo "$efficiency_ratio <= 1.5" | bc -l) )); then
+                threat_level="EXCELLENT"
+                threat_color="${GREEN}"
+                echo -e "  ${GREEN}• Intelligent Override: Proactive system working excellently${NC}"
+                echo -e "  ${GREEN}• System blocked $total_bans_today threats with $efficiency_ratio attempts per ban${NC}"
+            elif [ $efficiency_ratio -le 2 ]; then
+                threat_level="GOOD"
+                threat_color="${GREEN}" 
+                echo -e "  ${GREEN}• Intelligent Override: Proactive system working well${NC}"
+            fi
         fi
         
         # Display security metrics
@@ -3153,8 +3604,16 @@ check_fail2ban_status() {
         echo -e "  * Average attempts per IP: $attempts_per_ip"
         echo -e "  * Average bans per IP: $bans_per_ip"
         
-        # Convert threat score to health score (inverse: 100 - threat_score)
-        local health_score=$((100 - threat_score))
+        # Calculate health score based on final threat level (after intelligent override)
+        local health_score
+        case "$threat_level" in
+            "EXCELLENT") health_score=100 ;;
+            "GOOD") health_score=90 ;;
+            "FAIR") health_score=75 ;;
+            "POOR") health_score=50 ;;
+            "CRITICAL") health_score=15 ;;
+            *) health_score=$((100 - threat_score)) ;;
+        esac
         
         # Display threat level in security analysis
         echo -e "  * ${threat_color}Health Level: $threat_level${NC} (Score: ${health_score}/100)"
@@ -3253,8 +3712,6 @@ check_fail2ban_status() {
     
     # Track which modules have issues and capture detailed info for AI analysis
     local fail2ban_details=""
-    if [ $current_high_issues -gt 0 ]; then
-        # Distinguish between CRITICAL and HIGH threat levels
         if [ "$threat_level" = "CRITICAL" ]; then
         critical_modules_found+=("Fail2Ban")
             fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Critical security activity today - $total_bans_today bans, $total_currently_banned currently banned IPs"
@@ -3268,15 +3725,7 @@ check_fail2ban_status() {
             low_modules_found+=("Fail2Ban")
             fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Normal security activity today - $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs. System secure."
         else
-            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Fail2Ban functioning normally today: $total_attempts_today failed attempts, $total_bans_today bans, $total_unbans_today unbans, $total_currently_banned currently banned IPs. System secure."
-        fi
-    elif [ $current_medium_issues -gt 0 ]; then
-        medium_modules_found+=("Fail2Ban")
-        fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Normal security activity today - $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs. System secure."
-    elif [ $current_low_issues -gt 0 ]; then
-        low_modules_found+=("Fail2Ban")
-        fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Normal security activity today - $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs. System secure."
-    else
+        # EXCELLENT level - no issues
         fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Fail2Ban functioning normally today: $total_attempts_today failed attempts, $total_bans_today bans, $total_unbans_today unbans, $total_currently_banned currently banned IPs. System secure."
     fi
     
@@ -3501,7 +3950,7 @@ handle_args "$@"
 
 # Function to send email report
 send_email_report() {
-    # Safety checks for required variables
+    # Safety checks for required variables - use the same status as console
     if [ -z "$status" ]; then
         status="${YELLOW}⚠️ Unknown${NC}"
     fi
@@ -3510,15 +3959,6 @@ send_email_report() {
     fi
     if [ -z "$summary" ]; then
         summary="System status could not be determined"
-    fi
-    if [ -z "$high_issues" ]; then
-        high_issues=0
-    fi
-    if [ -z "$medium_issues" ]; then
-        medium_issues=0
-    fi
-    if [ -z "$low_issues" ]; then
-        low_issues=0
     fi
     
     local admin_email=$(grep 'CONTACT' /usr/local/vesta/data/users/admin/user.conf | cut -f 2 -d \')
@@ -3556,12 +3996,17 @@ send_email_report() {
     local status_icon="✓"
     local status_text="Healthy"
     
-    if [[ "$status" == *"Critical"* ]]; then
+    if [ ${#critical_modules[@]} -gt 0 ]; then
         status_color="#dc3545"
         status_bg="#f8d7da"
         status_icon="⚠️"
         status_text="Critical"
-    elif [[ "$status" == *"Needs Attention"* ]] || [[ "$status" == *"Minor Issues"* ]]; then
+    elif [ ${#poor_modules[@]} -gt 0 ]; then
+        status_color="#dc3545"
+        status_bg="#f8d7da"
+        status_icon="⚠️"
+        status_text="Needs Attention"
+    elif [ ${#fair_modules[@]} -gt 0 ]; then
         status_color="#fd7e14"
         status_bg="#fff3cd"
         status_icon="⚠️"
@@ -3596,183 +4041,243 @@ send_email_report() {
             </div>"
     
     # Add detailed summary if any issues are found
-    if [ ${#critical_modules_found[@]} -gt 0 ] || [ ${#medium_modules_found[@]} -gt 0 ] || [ ${#low_modules_found[@]} -gt 0 ]; then
+    if [ ${#critical_modules[@]} -gt 0 ] || [ ${#poor_modules[@]} -gt 0 ] || [ ${#fair_modules[@]} -gt 0 ]; then
         email_content+="<!-- Issues Section -->
             <div style='margin-bottom: 25px;'>
                 <h3 style='color: #343a40; margin: 0 0 20px 0; font-size: 20px; font-weight: 600; border-bottom: 2px solid #e9ecef; padding-bottom: 10px;'>Issues Detected</h3>"
         
-        if [ ${#critical_modules_found[@]} -gt 0 ]; then
+        if [ ${#critical_modules[@]} -gt 0 ]; then
         email_content+="<div style='margin-bottom: 20px;'>
                 <div style='background-color: #f8d7da; border-radius: 8px; padding: 16px; border-left: 4px solid #dc3545;'>
                     <h4 style='color: #721c24; margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center;'>
-                        <span style='margin-right: 8px;'>🚨</span> Critical Issues
+                        <span style='margin-right: 8px;'>❌</span> Critical Issues
                     </h4>
                     <div style='display: grid; gap: 8px;'>"
-            for module in "${critical_modules_found[@]}"; do
+            for module in "${critical_modules[@]}"; do
                 email_content+="<div style='background-color: #ffffff; padding: 12px; border-radius: 6px; color: #721c24; font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>$module</div>"
             done
             email_content+="</div></div></div>"
         fi
         
-        if [ ${#medium_modules_found[@]} -gt 0 ]; then
+        if [ ${#poor_modules[@]} -gt 0 ]; then
+            email_content+="<div style='margin-bottom: 20px;'>
+                <div style='background-color: #f8d7da; border-radius: 8px; padding: 16px; border-left: 4px solid #dc3545;'>
+                    <h4 style='color: #721c24; margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center;'>
+                        <span style='margin-right: 8px;'>⚠️</span> Poor Health Issues
+                    </h4>
+                    <div style='display: grid; gap: 8px;'>"
+            for module in "${poor_modules[@]}"; do
+                email_content+="<div style='background-color: #ffffff; padding: 12px; border-radius: 6px; color: #721c24; font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>$module</div>"
+            done
+            email_content+="</div></div></div>"
+        fi
+        
+        if [ ${#fair_modules[@]} -gt 0 ]; then
             email_content+="<div style='margin-bottom: 20px;'>
                 <div style='background-color: #fff3cd; border-radius: 8px; padding: 16px; border-left: 4px solid #fd7e14;'>
                     <h4 style='color: #856404; margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center;'>
-                        <span style='margin-right: 8px;'>⚠️</span> Medium Issues
+                        <span style='margin-right: 8px;'>⚠️</span> Fair Health Issues
                     </h4>
                     <div style='display: grid; gap: 8px;'>"
-            for module in "${medium_modules_found[@]}"; do
+            for module in "${fair_modules[@]}"; do
                 email_content+="<div style='background-color: #ffffff; padding: 12px; border-radius: 6px; color: #856404; font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>$module</div>"
             done
             email_content+="</div></div></div>"
         fi
         
-        if [ ${#low_modules_found[@]} -gt 0 ]; then
+        # Add detailed issue descriptions if available
+        if [ -n "$DETAILED_ISSUES_EMAIL" ]; then
             email_content+="<div style='margin-bottom: 20px;'>
-                <div style='background-color: #d1ecf1; border-radius: 8px; padding: 16px; border-left: 4px solid #17a2b8;'>
-                    <h4 style='color: #0c5460; margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center;'>
-                        <span style='margin-right: 8px;'>ℹ️</span> Low Priority Issues
+                <div style='background-color: #f8f9fa; border-radius: 8px; padding: 16px; border-left: 4px solid #fd7e14;'>
+                    <h4 style='color: #343a40; margin: 0 0 12px 0; font-size: 16px; font-weight: 600; display: flex; align-items: center;'>
+                        <span style='margin-right: 8px;'>⚠️</span> Detailed Issue Report
                     </h4>
-                    <div style='display: grid; gap: 8px;'>"
-            for module in "${low_modules_found[@]}"; do
-                email_content+="<div style='background-color: #ffffff; padding: 12px; border-radius: 6px; color: #0c5460; font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>$module</div>"
-            done
-            email_content+="</div></div></div>"
+                    $DETAILED_ISSUES_EMAIL
+                </div>
+            </div>"
         fi
         
-        # Add detailed system information - always show all modules in console order
-        email_content+="<!-- System Details Section -->
+        # Removed the section for good_modules to align email with summary
+        # GOOD status should not be considered as needing review in the email
+        
+    else
+        email_content+="<!-- No Issues Section -->
             <div style='margin-bottom: 25px;'>
-                <h3 style='color: #343a40; margin: 0 0 20px 0; font-size: 20px; font-weight: 600; border-bottom: 2px solid #e9ecef; padding-bottom: 10px;'>System Details</h3>
-                <div style='background-color: #f8f9fa; border-radius: 8px; padding: 20px;'>"
-        
-        # Define modules in console order with their configuration status
-        local modules_order=(
-            "system_resources:System Resources:🖥️:CHECK_SYSTEM_RESOURCES"
-            "services:MyVestaCP Services:⚙️:CHECK_MYVESTACP_SERVICES"
-            "php:PHP-FPM:🐘:CHECK_PHP"
-            "mysql:MySQL Database:🗄️:CHECK_MYSQL"
-            "clamav:ClamAV Antivirus:🦠:CHECK_CLAMAV"
-            "fail2ban:Fail2Ban Security:🛡️:CHECK_FAIL2BAN"
-            "email:EXIM4 System:📧:CHECK_EXIM4"
-            "ssl:SSL Certificates:🔒:CHECK_SSL"
-            "backup:Backup System:💾:CHECK_BACKUP"
-        )
-        
-        for module_info in "${modules_order[@]}"; do
-            IFS=':' read -r module_key module_display_name module_icon config_var <<< "$module_info"
-            
-            # Check if module is enabled
-            local is_enabled=false
-            case "$config_var" in
-                "CHECK_SYSTEM_RESOURCES") [ "$CHECK_SYSTEM_RESOURCES" = true ] && is_enabled=true ;;
-                "CHECK_MYVESTACP_SERVICES") [ "$CHECK_MYVESTACP_SERVICES" = true ] && is_enabled=true ;;
-                "CHECK_PHP") [ "$CHECK_PHP" = true ] && is_enabled=true ;;
-                "CHECK_MYSQL") [ "$CHECK_MYSQL" = true ] && is_enabled=true ;;
-                "CHECK_CLAMAV") [ "$CHECK_CLAMAV" = true ] && is_enabled=true ;;
-                "CHECK_FAIL2BAN") [ "$CHECK_FAIL2BAN" = true ] && is_enabled=true ;;
-                "CHECK_EXIM4") [ "$CHECK_EXIM4" = true ] && is_enabled=true ;;
-                "CHECK_SSL") [ "$CHECK_SSL" = true ] && is_enabled=true ;;
-                "CHECK_BACKUP") [ "$CHECK_BACKUP" = true ] && is_enabled=true ;;
-            esac
-            
-            local module_content=""
-            local border_color="#6c757d"
-            local bg_color="#ffffff"
-            local text_color="#495057"
-            
-            if [ "$is_enabled" = true ]; then
-                # Module is enabled, determine status color based on issues
-                local module_status="healthy"
-                
-                # Check if module has critical issues
-                for critical_module in "${critical_modules_found[@]}"; do
-                    if [[ "$critical_module" == *"$module_display_name"* ]] || [[ "$critical_module" == "$module_key"* ]] || [[ "$critical_module" == "System Resources"* && "$module_key" == "system_resources" ]] || [[ "$critical_module" == "MyVestaCP Services"* && "$module_key" == "services" ]] || [[ "$critical_module" == "PHP-FPM"* && "$module_key" == "php" ]] || [[ "$critical_module" == "MySQL"* && "$module_key" == "mysql" ]] || [[ "$critical_module" == "ClamAV"* && "$module_key" == "clamav" ]] || [[ "$critical_module" == "Fail2Ban"* && "$module_key" == "fail2ban" ]] || [[ "$critical_module" == "Exim4"* && "$module_key" == "email" ]] || [[ "$critical_module" == "SSL"* && "$module_key" == "ssl" ]] || [[ "$critical_module" == "Backup"* && "$module_key" == "backup" ]]; then
-                        module_status="critical"
-                        break
-                    fi
-                done
-                
-                # Check if module has medium issues (only if not critical)
-                if [ "$module_status" = "healthy" ]; then
-                    for medium_module in "${medium_modules_found[@]}"; do
-                        if [[ "$medium_module" == *"$module_display_name"* ]] || [[ "$medium_module" == "$module_key"* ]] || [[ "$medium_module" == "System Resources"* && "$module_key" == "system_resources" ]] || [[ "$medium_module" == "MyVestaCP Services"* && "$module_key" == "services" ]] || [[ "$medium_module" == "PHP-FPM"* && "$module_key" == "php" ]] || [[ "$medium_module" == "MySQL"* && "$module_key" == "mysql" ]] || [[ "$medium_module" == "ClamAV"* && "$module_key" == "clamav" ]] || [[ "$medium_module" == "Fail2Ban"* && "$module_key" == "fail2ban" ]] || [[ "$medium_module" == "Exim4"* && "$module_key" == "email" ]] || [[ "$medium_module" == "SSL"* && "$module_key" == "ssl" ]] || [[ "$medium_module" == "Backup"* && "$module_key" == "backup" ]]; then
-                            module_status="medium"
-                            break
-                        fi
-                    done
-                fi
-                
-                # Check if module has low issues (only if not critical or medium)
-                if [ "$module_status" = "healthy" ]; then
-                    for low_module in "${low_modules_found[@]}"; do
-                        if [[ "$low_module" == *"$module_display_name"* ]] || [[ "$low_module" == "$module_key"* ]] || [[ "$low_module" == "System Resources"* && "$module_key" == "system_resources" ]] || [[ "$low_module" == "MyVestaCP Services"* && "$module_key" == "services" ]] || [[ "$low_module" == "PHP-FPM"* && "$module_key" == "php" ]] || [[ "$low_module" == "MySQL"* && "$module_key" == "mysql" ]] || [[ "$low_module" == "ClamAV"* && "$module_key" == "clamav" ]] || [[ "$low_module" == "Fail2Ban"* && "$module_key" == "fail2ban" ]] || [[ "$low_module" == "Exim4"* && "$module_key" == "email" ]] || [[ "$low_module" == "SSL"* && "$module_key" == "ssl" ]] || [[ "$low_module" == "Backup"* && "$module_key" == "backup" ]]; then
-                            module_status="low"
-                            break
-                        fi
-                    done
-                fi
-                
-                # Set colors based on status
-                case "$module_status" in
-                    "critical")
-                        border_color="#dc3545"  # Red
-                        bg_color="#fff5f5"
-                        text_color="#721c24"
-                        ;;
-                    "medium")
-                        border_color="#fd7e14"  # Orange/Yellow
-                        bg_color="#fff8f0"
-                        text_color="#856404"
-                        ;;
-                    "low")
-                        border_color="#6c757d"  # Gray
-                        bg_color="#f8f9fa"
-                        text_color="#495057"
-                        ;;
-                    "healthy")
-                        border_color="#28a745"  # Green
-                        bg_color="#f8fff9"
-                        text_color="#155724"
-                        ;;
-                esac
-                
-                # Module is enabled, show detailed report if available
-                if [ -n "${detailed_report[$module_key]}" ]; then
-                    module_content="${detailed_report[$module_key]}"
-                else
-                    module_content="Module scan completed - No detailed information available"
-                fi
-            else
-                # Module is disabled
-                module_content="Module scan deactivated"
-                border_color="#dc3545"  # Red for disabled
-                bg_color="#fff5f5"
-                text_color="#721c24"
-            fi
-            
-            email_content+="<div style='background-color: $bg_color; margin-bottom: 12px; padding: 16px; border-radius: 6px; border-left: 4px solid $border_color; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
-                <div style='color: $text_color; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center;'>
-                    <span style='margin-right: 8px;'>$module_icon</span>
-                    $module_display_name
+                <h3 style='color: #343a40; margin: 0 0 20px 0; font-size: 20px; font-weight: 600; border-bottom: 2px solid #e9ecef; padding-bottom: 10px;'>Issues Detected</h3>
+                <div style='background-color: #d4edda; border-radius: 8px; padding: 16px; border-left: 4px solid #28a745;'>
+                    <h4 style='color: #155724; margin: 0; font-size: 16px; font-weight: 600; display: flex; align-items: center;'>
+                        <span style='margin-right: 8px;'>✓</span> No Issues Found
+                    </h4>
                 </div>
-                <div style='color: #6c757d; font-size: 14px; line-height: 1.4;'>$module_content</div>
             </div>"
-        done
-        
-        email_content+="</div></div>"
-        
-            email_content+="</div>"
-        else
-            email_content+="<!-- All Systems Healthy -->
-                <div style='margin-bottom: 25px;'>
-                    <div style='background-color: #d4edda; border-radius: 8px; padding: 25px; text-align: center; border-left: 4px solid #28a745;'>
-                        <div style='font-size: 48px; margin-bottom: 15px;'>✅</div>
-                        <h3 style='color: #155724; margin: 0 0 10px 0; font-size: 22px; font-weight: 600;'>All Systems Healthy</h3>
-                        <p style='color: #155724; margin: 0; font-size: 16px; opacity: 0.8;'>No issues detected across all monitored modules</p>
-                    </div>
-        </div>"
     fi
+    
+    # Add system details with consistent scoring display
+        email_content+="<!-- System Details Section -->
+"
+    email_content+="<div style='margin-bottom: 25px;'>"
+    email_content+="    <h3 style='color: #343a40; margin: 0 0 20px 0; font-size: 20px; font-weight: 600; border-bottom: 2px solid #e9ecef; padding-bottom: 10px;'>System Details</h3>
+"
+    email_content+="    <div style='background-color: #f8f9fa; border-radius: 8px; padding: 20px;'>"
+    
+    # Function to add module to email with consistent scoring display
+    add_module_to_email() {
+        local key="$1"
+        local icon="$2"
+        local title="$3"
+        local description="$4"
+        local health_level=""
+        local score=""
+        local bg_color="#f8fff9"
+        local border_color="#28a745"
+        
+        # Extract health level and score if available
+        if [[ $description =~ Health[[:space:]]+Level:[[:space:]]*([A-Z]+) ]]; then
+            health_level=${BASH_REMATCH[1]}
+        fi
+        if [[ $description =~ Score:[[:space:]]*([0-9]+) ]]; then
+            score=${BASH_REMATCH[1]}
+        fi
+        
+        # Ajuste extra: nunca mostrar mensagem otimista se health_level != EXCELLENT
+        if [[ "$health_level" != "EXCELLENT" ]]; then
+            case "$key" in
+                "exim4")
+                    if [[ "$description" =~ "Mail system operating without issues" ]]; then
+                        description="EXIM4: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "clamav")
+                    if [[ "$description" =~ "No infections detected" ]]; then
+                        description="ClamAV: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "fail2ban")
+                    if [[ "$description" =~ "System secure" ]]; then
+                        description="Fail2Ban: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "ssl")
+                    if [[ "$description" =~ "All certificates valid" || "$description" =~ "No issues detected" ]]; then
+                        description="SSL: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "mysql")
+                    if [[ "$description" =~ "No issues detected" ]]; then
+                        description="MySQL: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "resources")
+                    if [[ "$description" =~ "functioning optimally" ]]; then
+                        description="System resources: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                *)
+                    if [[ "$description" =~ "No issues detected" || "$description" =~ "functioning optimally" ]]; then
+                        description="System: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+            esac
+        fi
+        
+        # Adjust colors based on health level
+        if [[ "$health_level" == "CRITICAL" || "$health_level" == "POOR" ]]; then
+            bg_color="#fff0f0"
+            border_color="#dc3545"
+        elif [[ "$health_level" == "FAIR" ]]; then
+            bg_color="#fff3cd"
+            border_color="#fd7e14"
+        fi
+        
+        # If no health level or score, add default for consistency
+        if [[ -z "$health_level" ]]; then
+            health_level="EXCELLENT"
+            score="100"
+        fi
+        
+        # Ensure description is not empty and reflects issues if any
+        if [[ -z "$description" || "$description" == *" - "* ]]; then
+            case "$key" in
+                "resources")
+                    if [[ "$health_level" == "EXCELLENT" ]]; then
+                        description="System resources functioning optimally: CPU, memory, and disk usage within normal limits"
+                    else
+                        description="System resources: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "exim4")
+                    if [[ "$health_level" == "EXCELLENT" ]]; then
+                        description="EXIM4 functioning optimally: Mail system operating without issues"
+                    else
+                        description="EXIM4: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                "backup")
+                    if [[ "$health_level" == "EXCELLENT" ]]; then
+                        description="Backup system functioning optimally: Backups are up to date and running as scheduled"
+                    else
+                        description="Backup system: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+                *)
+                    if [[ "$health_level" == "EXCELLENT" ]]; then
+                        description="System functioning optimally: No issues detected"
+                    else
+                        description="System: Minor issues detected, monitoring recommended (see details above)"
+                    fi
+                    ;;
+            esac
+        else
+            # Extract issues from detailed report if health level is not EXCELLENT
+            if [[ "$health_level" != "EXCELLENT" && "$key" == "php" ]]; then
+                if [[ $description =~ Performance[[:space:]]+warnings[[:space:]]+today:[[:space:]]*([0-9]+) ]]; then
+                    local warnings=${BASH_REMATCH[1]}
+                    description="PHP monitoring needed: $warnings performance warning(s) detected, consider adjusting max_children settings"
+                elif [[ $description =~ Potentially[[:space:]]+stuck[[:space:]]+processes:[[:space:]]*([0-9]+) ]]; then
+                    local stuck=${BASH_REMATCH[1]}
+                    description="PHP monitoring needed: Potential stuck processes detected across versions"
+                else
+                    description="PHP monitoring needed: Minor issues detected affecting performance score"
+                fi
+            fi
+        fi
+        
+        email_content+="<div style='background-color: $bg_color; margin-bottom: 12px; padding: 16px; border-radius: 6px; border-left: 4px solid $border_color; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+"
+        email_content+="    <div style='color: #155724; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center;'>
+"
+        email_content+="        <span style='margin-right: 8px;'>$icon</span>
+"
+        email_content+="        $title
+"
+        email_content+="    </div>
+"
+        email_content+="    <div style='color: #6c757d; font-size: 14px; line-height: 1.4;'>
+"
+        if [[ -n "$health_level" && -n "$score" ]]; then
+            email_content+="Health Level: $health_level (Score: $score/100) - "
+        fi
+        email_content+="$description</div>
+"
+        email_content+="</div>"
+    }
+    
+    # Add system details using the function for consistency
+    if [ ${#detailed_report[@]} -gt 0 ]; then
+        add_module_to_email "resources" "🖥️" "System Resources" "${detailed_report[resources]}"
+        add_module_to_email "services" "⚙️" "MyVestaCP Services" "${detailed_report[services]}"
+        add_module_to_email "php" "🐘" "PHP-FPM" "${detailed_report[php]}"
+        add_module_to_email "mysql" "🗄️" "MySQL Database" "${detailed_report[mysql]}"
+        add_module_to_email "clamav" "🦠" "ClamAV Antivirus" "${detailed_report[clamav]}"
+        add_module_to_email "fail2ban" "🛡️" "Fail2Ban Security" "${detailed_report[fail2ban]}"
+        add_module_to_email "exim4" "📧" "EXIM4 System" "${detailed_report[exim4]}"
+        add_module_to_email "ssl" "🔒" "SSL Certificates" "${detailed_report[ssl]}"
+        add_module_to_email "backup" "💾" "Backup System" "${detailed_report[backup]}"
+    else
+        email_content+="<div style='color: #6c757d; font-size: 14px; text-align: center; padding: 20px;'>No detailed system information available. All checks might be disabled.</div>"
+    fi
+    email_content+="</div>"
+    email_content+="</div>"
     
     # Add AI analysis section - always show regardless of AI_ENABLED status
     email_content+="<!-- AI Analysis Section -->
@@ -4000,12 +4505,16 @@ send_email_report() {
 </body>
 </html>"
     
-    # Send email using sendmail with HTML content
+    # Send email using sendmail with HTML content and log attachment
     local sendmail_result=0
+    local log_file_to_attach="$LOG_FILE"
+    local log_filename=$(basename "$log_file_to_attach")
+    local clean_log_content=$(cat "$log_file_to_attach" | sed 's/\033\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*m//g')
+    
     (
         echo "Subject: $email_subject"
         echo "MIME-Version: 1.0"
-        echo "Content-Type: text/html; charset=UTF-8"
+        echo "Content-Type: multipart/mixed; boundary=\"boundary\""
         echo "From: MyVestaCP System Report <noreply@$(hostname)>"
         echo "Reply-To: $admin_email"
         echo "X-Mailer: MyVestaCP System Report"
@@ -4013,13 +4522,22 @@ send_email_report() {
         echo "X-MSMail-Priority: High"
         echo "Importance: High"
         echo
+        echo "--boundary"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo
         echo "$email_content"
+        echo "--boundary"
+        echo "Content-Type: text/plain; name=$log_filename"
+        echo "Content-Disposition: attachment; filename=$log_filename"
+        echo
+        echo "$clean_log_content"
+        echo "--boundary--"
     ) | /usr/sbin/sendmail -f "noreply@$(hostname)" "$admin_email" 2>/dev/null
     sendmail_result=$?
     
     # Log email status
     if [ $sendmail_result -eq 0 ]; then
-        log_email_status "Success" "$admin_email" "sendmail" ""
+        log_email_status "Success" "$admin_email" "sendmail" "Log file attached successfully: $log_file_to_attach"
     else
         log_email_status "Failed" "$admin_email" "sendmail" "Failed to send email (exit code: $sendmail_result)"
     fi
@@ -4033,6 +4551,7 @@ setup_logging
 
 # Run checks for required tools
 check_and_install_jq
+check_and_install_mutt
 
 log_message "Starting system check"
 
@@ -4141,110 +4660,132 @@ fi
 myvestacp_updates=$(run_with_timeout 10 "apt-get -s upgrade 2>/dev/null | grep -i 'myvestacp' | wc -l")
 myvestacp_status=$?
 
-# Final System Health Summary
-echo -e "\n${BLUE}=== System Health Summary ===${NC}"
-
-# Display MyVestaCP status
-if [ $myvestacp_status -eq 0 ] && [ "$myvestacp_updates" -gt 0 ]; then
-     echo -e "${YELLOW}⚠️  MyVestaCP has $myvestacp_updates updates available${NC}"
-elif [ $myvestacp_status -eq 0 ]; then
-    echo -e "${GREEN}✓ MyVestaCP is up to date with version: $myvestacp_version Build date: $myvestacp_build_date${NC}"
+# Display MyVestaCP version and build information
+echo -e "
+${BLUE}=== MyVestaCP Version Information ===${NC}"
+if [ -n "$myvestacp_version" ]; then
+    echo -e "Version: ${GREEN}$myvestacp_version${NC}"
 else
-    echo -e "${RED}⚠️  Failed to check MyVestaCP updates status${NC}"
+    echo -e "Version: ${YELLOW}Not available${NC}"
+fi
+if [ -n "$myvestacp_build_date" ]; then
+    echo -e "Build Date: ${GREEN}$myvestacp_build_date${NC}"
+else
+    echo -e "Build Date: ${YELLOW}Not available${NC}"
+fi
+if [ $myvestacp_status -eq 0 ] && [ "$myvestacp_updates" -gt 0 ]; then
+    echo -e "Updates: ${YELLOW}Update available${NC}"
+else
+    echo -e "Updates: ${GREEN}Up to date${NC}"
 fi
 
-# Display backup status
+# Display backup status before System Health Summary
+echo -e "
+${BLUE}=== Backup Status ===${NC}"
 echo -e "$backup_status"
 
-# Capture backup details for AI analysis
-if [[ "$backup_status" == *"SUCCESS"* ]]; then
-    detailed_report["backup"]="Backup system functioning normally - Last successful backup completed"
-elif [[ "$backup_status" == *"FAILED"* ]]; then
-    detailed_report["backup"]="Backup system has critical issues - Last backup failed"
-elif [[ "$backup_status" == *"disabled"* ]]; then
-    detailed_report["backup"]="Backup monitoring is disabled in configuration"
-else
-    detailed_report["backup"]="Backup status unclear - May need investigation"
-fi
+# Final System Health Summary
+echo -e "
+${BLUE}=== System Health Summary ===${NC}"
 
-# Determine overall status with more intelligent analysis
-status=""
-risk_level=""
-summary=""
+# Check MyVestaCP version
+# check_vestacp_version  # Commented out as the function is not defined
 
-# Critical conditions (any of these makes the system critical)
-if [ $high_issues -gt 0 ]; then
-    status="${RED}⚠️ High Risk${NC}"
-    risk_level="${RED}High${NC}"
-    summary="High risk issues detected: "
-    if [ $high_issues -gt 1 ]; then
-        summary+="$high_issues high-priority problems"
-    else
-        summary+="1 high-priority problem"
+# Initialize arrays for health levels
+critical_modules=()
+poor_modules=()
+fair_modules=()
+good_modules=()
+excellent_modules=()
+
+# Categorize modules based on their health levels extracted from detailed_report
+for key in "${!detailed_report[@]}"; do
+    report="${detailed_report[$key]}"
+    if [[ $report =~ Health[[:space:]]+Level:[[:space:]]*([A-Z]+) ]]; then
+        level=${BASH_REMATCH[1]}
+        case $level in
+            "CRITICAL")
+                critical_modules+=("$key")
+                ;;
+            "POOR")
+                poor_modules+=("$key")
+                ;;
+            "FAIR")
+                fair_modules+=("$key")
+                ;;
+            "GOOD")
+                good_modules+=("$key")
+                ;;
+            "EXCELLENT")
+                excellent_modules+=("$key")
+                ;;
+        esac
     fi
-    summary+=" requiring immediate attention"
-elif [ $medium_issues -gt 100 ]; then
-    # High number of medium issues is also critical
-    status="${RED}⚠️ Critical${NC}"
-    risk_level="${RED}Critical${NC}"
-    summary="Critical number of issues: $medium_issues medium problems detected"
-elif [ $medium_issues -gt 0 ]; then
-    status="${YELLOW}⚠️ Needs Attention${NC}"
-    risk_level="${YELLOW}Medium${NC}"
-    summary="System needs attention: $medium_issues issues to review"
-elif [ $low_issues -gt 0 ]; then
-    status="${YELLOW}⚠️ Minor Issues${NC}"
-    risk_level="${YELLOW}Low${NC}"
-    summary="Minor issues present: $low_issues items to monitor"
+done
+
+# Determine overall system status based on the worst health level
+status_color="${GREEN}"
+status="✓ Healthy"
+risk_level="None"
+summary="All systems operating normally"
+
+if [ ${#critical_modules[@]} -gt 0 ]; then
+    status_color="${RED}"
+    status="⚠️ Critical"
+    risk_level="High"
+    summary="Critical system issues detected: ${#critical_modules[@]} module(s) with critical problems"
+elif [ ${#poor_modules[@]} -gt 0 ]; then
+    status_color="${RED}"
+    status="⚠️ Needs Attention"
+    risk_level="High"
+    summary="System needs attention: ${#poor_modules[@]} module(s) with poor health"
+elif [ ${#fair_modules[@]} -gt 0 ]; then
+    status_color="${YELLOW}"
+    status="⚠️ Needs Attention"
+    risk_level="Medium"
+    summary="System needs attention: ${#fair_modules[@]} module(s) with fair health"
 else
-    status="${GREEN}✓ Healthy${NC}"
-    risk_level="${GREEN}None${NC}"
+    status_color="${GREEN}"
+    status="✓ Healthy"
+    risk_level="None"
     summary="All systems operating normally"
 fi
 
-# Display overall status and risk level with summary
-echo -e "\nOverall System Status: $status"
+echo -e "\nOverall System Status: $status_color$status${NC}"
 echo -e "Risk Level: $risk_level"
 echo -e "Summary: $summary"
 
-# Only show detailed issues if there are any
-if [ $high_issues -gt 0 ] || [ $medium_issues -gt 0 ] || [ $low_issues -gt 0 ]; then
-    echo -e "\nIssues Found (by priority):"
-    
-    if [ ${#critical_modules_found[@]} -gt 0 ]; then
-        echo -e "\n${RED}CRITICAL (${#critical_modules_found[@]} modules):${NC}"
-        for module in "${critical_modules_found[@]}"; do
+# Display issues by health level priority
+echo -e "
+Issues Found (by priority):"
+if [ ${#critical_modules[@]} -gt 0 ]; then
+    echo -e "
+${RED}CRITICAL (${#critical_modules[@]} modules):${NC}"
+    for module in "${critical_modules[@]}"; do
             echo -e "  - $module"
         done
     fi
-
-    if [ ${#high_modules_found[@]} -gt 0 ]; then
-        echo -e "\n${RED}HIGH (${#high_modules_found[@]} modules):${NC}"
-        for module in "${high_modules_found[@]}"; do
+if [ ${#poor_modules[@]} -gt 0 ]; then
+    echo -e "
+${RED}POOR (${#poor_modules[@]} modules):${NC}"
+    for module in "${poor_modules[@]}"; do
             echo -e "  - $module"
         done
     fi
-
-    if [ ${#medium_modules_found[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}MEDIUM (${#medium_modules_found[@]} modules):${NC}"
-        for module in "${medium_modules_found[@]}"; do
+if [ ${#fair_modules[@]} -gt 0 ]; then
+    echo -e "
+${YELLOW}FAIR (${#fair_modules[@]} modules):${NC}"
+    for module in "${fair_modules[@]}"; do
             echo -e "  - $module"
         done
     fi
-
-    if [ ${#low_modules_found[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}LOW (${#low_modules_found[@]} modules):${NC}"
-        for module in "${low_modules_found[@]}"; do
-            echo -e "  - $module"
-        done
-    fi
-
-    # Show detailed summary with AI analysis
-    show_detailed_summary
+if [ ${#critical_modules[@]} -eq 0 ] && [ ${#poor_modules[@]} -eq 0 ] && [ ${#fair_modules[@]} -eq 0 ]; then
+    echo -e "${GREEN}✓ No issues found in analyzed modules${NC}"
 fi
 
 # Send email report
-echo -e "\n${BLUE}=== Sending Email Report ===${NC}"
+echo -e "
+${BLUE}=== Sending Email Report ===${NC}"
 
 if [ "$SEND_EMAIL_REPORT" = true ]; then
     # Temporarily disable error trap for email function to avoid false positives
