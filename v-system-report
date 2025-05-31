@@ -235,36 +235,11 @@ function check_and_install_jq() {
             return 1
         fi
     else
-        log_message "${GREEN}✓  jq already installed${NC}"
+        log_message "${GREEN}✓ jq already installed${NC}"
     fi
     return 0
 }
 
-# Function to check and install mutt if not present
-function check_and_install_mutt() {
-    if ! command -v mutt &> /dev/null; then
-        log_message "${YELLOW}⚠️  mutt not found. Installing mutt...${NC}"
-        if command -v apt-get &> /dev/null; then
-            run_with_timeout 60 "apt-get update && apt-get install -y mutt"
-        elif command -v yum &> /dev/null; then
-            run_with_timeout 60 "yum install -y mutt"
-        elif command -v dnf &> /dev/null; then
-            run_with_timeout 60 "dnf install -y mutt"
-        else
-            log_message "${RED}⚠️  Could not install mutt. Package manager not found.${NC}"
-            return 1
-        fi
-        if [ $? -eq 0 ]; then
-            log_message "${GREEN}✓  mutt installed successfully${NC}"
-        else
-            log_message "${RED}⚠️  Failed to install mutt. Installation timed out or failed.${NC}"
-            return 1
-        fi
-    else
-        log_message "${GREEN}✓  mutt already installed${NC}"
-    fi
-    return 0
-}
 
 # Function to check and install geoiplookup if needed
 check_and_install_geoiplookup() {
@@ -4550,7 +4525,7 @@ setup_logging
 
 # Run checks for required tools
 check_and_install_jq
-check_and_install_mutt
+check_and_install_geoiplookup
 
 log_message "Starting system check"
 
