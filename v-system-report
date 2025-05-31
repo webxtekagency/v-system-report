@@ -1,5 +1,17 @@
 #!/bin/bash
 
+# General Overview of Scoring System and Health Levels for AI Analysis
+# This script evaluates the health of various system modules (e.g., PHP, MySQL, ClamAV) using a scoring system (0-100).
+# Scores are calculated based on weighted factors specific to each module (e.g., service status, performance, configuration).
+# Health Levels are assigned as follows:
+# - EXCELLENT (Score: 100): System functioning optimally, no issues detected.
+# - GOOD (Score: 90-99): Minor issues may be present, monitoring recommended, no immediate impact.
+# - FAIR (Score: 75-89): Moderate issues detected, performance may be affected, action recommended soon.
+# - POOR (Score: 50-74): Significant issues, system stability or security at risk, immediate attention required.
+# - CRITICAL (Score: <50): Severe issues, system inoperable or at high risk, urgent action needed.
+# AI Instructions: Prioritize modules with CRITICAL or POOR health levels, suggest specific actions or commands for resolution, and summarize overall system impact.
+# Note: Scoring weights and penalties vary by module due to their unique operational requirements, but the health level thresholds are consistent across all modules.
+
 # Color definitions for console output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -27,7 +39,7 @@ EMAIL_SUBJECT="MyVestaCP System Report - $(date '+%Y-%m-%d')"
 
 # AI Integration Configuration
 # Set to true to enable AI analysis of the report
-AI_ENABLED=false
+AI_ENABLED=true
 AI_MODE="auto"  # Options: "auto", "always", or "never"
 AI_API_KEY="" #Add your HuggingFace API key
 AI_MODEL="mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -2191,19 +2203,19 @@ check_php_status() {
     if [ $current_high_issues -gt 0 ]; then
         if [ "$php_health_level" = "CRITICAL" ]; then
         critical_modules_found+=("PHP-FPM")
-            php_details="Health Level: $php_health_level (Score: ${health_score}/100) - Critical PHP issues: Service failures, critical errors, or major configuration problems across ${#php_versions[@]} version(s)"
+            php_details="Health Level: $php_health_level (Score: ${health_score}/100) - Critical PHP issues: Service failures, critical errors, or major configuration problems across ${#php_versions[@]} version(s) - Immediate action required: Check service status and logs for errors."
         else
             high_modules_found+=("PHP-FPM")
-            php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP issues requiring attention: Performance problems or minor errors across ${#php_versions[@]} version(s)"
+            php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP issues requiring attention: Performance problems or minor errors across ${#php_versions[@]} version(s) - Action recommended: Review performance metrics and error logs."
         fi
     elif [ $current_medium_issues -gt 0 ]; then
         medium_modules_found+=("PHP-FPM")
-        php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP monitoring needed: Configuration issues or performance concerns across ${#php_versions[@]} version(s)"
+        php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP monitoring needed: Configuration issues or performance concerns across ${#php_versions[@]} version(s) - Monitor closely for potential escalation."
     elif [ $current_low_issues -gt 0 ]; then
         low_modules_found+=("PHP-FPM")
-        php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP minor issues: Non-critical warnings across ${#php_versions[@]} version(s)"
+        php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP minor issues: Non-critical warnings across ${#php_versions[@]} version(s) - Routine monitoring recommended."
     else
-        php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP-FPM functioning optimally: ${#php_versions[@]} version(s) running without issues ($(printf '%s ' "${php_versions[@]}"))"
+        php_details="Health Level: $php_health_level (Score: ${health_score}/100) - PHP functioning optimally: ${#php_versions[@]} version(s) running without issues ($(printf '%s ' "${php_versions[@]}")) - No action needed."
     fi
     
     detailed_report["php"]="$php_details"
@@ -2586,19 +2598,19 @@ ${YELLOW}Analyzing logs for additional context...${NC}"
     if [ $current_high_issues -gt 0 ]; then
         if [ "$mysql_health_level" = "CRITICAL" ]; then
         critical_modules_found+=("MySQL")
-            mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - Critical MySQL issues: Service failures, connection problems, or major performance issues"
+            mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - Critical MySQL issues: Service failures, connection problems, or major performance issues - Immediate action required: Check service status and error logs."
         else
             high_modules_found+=("MySQL")
-            mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL issues requiring attention: Performance problems or connection issues"
+            mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL issues requiring attention: Performance problems or connection issues - Action recommended: Review performance metrics and logs."
         fi
     elif [ $current_medium_issues -gt 0 ]; then
         medium_modules_found+=("MySQL")
-        mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL monitoring needed: Configuration issues or performance concerns"
+        mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL monitoring needed: Configuration issues or performance concerns - Monitor closely for potential escalation."
     elif [ $current_low_issues -gt 0 ]; then
         low_modules_found+=("MySQL")
-        mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL minor issues: Non-critical warnings"
+        mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL minor issues: Non-critical warnings - Routine monitoring recommended."
     else
-        mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL functioning optimally: Service running without issues"
+        mysql_details="Health Level: $mysql_health_level (Score: ${health_score}/100) - MySQL functioning optimally: Service running without issues - No action needed."
     fi
     
     detailed_report["mysql"]="$mysql_details"
@@ -2970,38 +2982,28 @@ check_clamav_status() {
     if [ $current_high_issues -gt 0 ]; then
         if [ "$clamav_threat_level" = "CRITICAL" ]; then
         critical_modules_found+=("ClamAV")
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Critical threat: Unresolved malware infections or services not running - Immediate action required: Check service status and quarantine."
         else
             high_modules_found+=("ClamAV")
-        fi
-        
-        # Generate intelligent threat details
-        if [ "$unresolved_infections" -gt 0 ]; then
-            clamav_details="$clamav_threat_level threat: $unresolved_infections unresolved malware infections detected (Score: ${health_score}/100) - Immediate action required"
-        elif [ "$clamav_running" = false ] || [ "$freshclam_running" = false ]; then
-            clamav_details="$clamav_threat_level threat: ClamAV services not running (Score: ${health_score}/100) - Antivirus protection disabled"
-        elif [ "$database_errors" -gt 0 ]; then
-            clamav_details="$clamav_threat_level threat: $database_errors database errors detected (Score: ${health_score}/100) - Antivirus database corrupted"
-        else
-            clamav_details="$clamav_threat_level threat: Multiple security issues detected (Score: ${health_score}/100) - System requires attention"
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Elevated threat: Multiple security issues detected - Action recommended: Review database status and scan logs."
         fi
     elif [ $current_medium_issues -gt 0 ]; then
         medium_modules_found+=("ClamAV")
         if [ -n "$database_age_days" ] && [[ "$database_age_days" =~ ^[0-9]+$ ]] && [ "$database_age_days" -gt 7 ]; then
-            clamav_details="$clamav_threat_level threat: Database is $database_age_days days old (Score: ${health_score}/100) - Antivirus signatures outdated"
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Moderate threat: Database is $database_age_days days old, antivirus signatures outdated - Update database immediately."
         else
-            clamav_details="$clamav_threat_level threat: Database maintenance issues (Score: ${health_score}/100) - No recent updates or activity"
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Moderate threat: Database maintenance issues, no recent updates - Monitor and update as needed."
         fi
     elif [ $current_low_issues -gt 0 ]; then
         low_modules_found+=("ClamAV")
         if [ "$resolved_infections" -gt 0 ]; then
-            clamav_details="$clamav_threat_level risk: $resolved_infections malware infections detected and resolved (Score: ${health_score}/100) - System working properly"
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Low risk: $resolved_infections malware infections detected and resolved - Routine monitoring recommended."
         elif [ "$scan_performance_issues" -eq 1 ]; then
-            clamav_details="$clamav_threat_level risk: Performance issues detected (Score: ${health_score}/100) - Some scans taking longer than expected"
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Low risk: Performance issues detected in scans - Routine monitoring recommended."
         else
-            clamav_details="$clamav_threat_level risk: Minor operational issues (Score: ${health_score}/100) - System functioning with minor concerns"
+            clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - Low risk: Minor operational issues - Routine monitoring recommended."
         fi
     else
-        # No issues - system is healthy
         local db_activity=""
         if [ "$updates" -gt 0 ]; then
             db_activity="$updates database updates"
@@ -3010,7 +3012,6 @@ check_clamav_status() {
         else
             db_activity="database status stable"
         fi
-        
         local additional_info=""
         if [ -n "$database_age_days" ] && [[ "$database_age_days" =~ ^[0-9]+$ ]] && [ "$database_age_days" -gt 0 ]; then
             additional_info=", database age: $database_age_days days"
@@ -3018,8 +3019,7 @@ check_clamav_status() {
         if [ -n "$quarantine_files" ] && [[ "$quarantine_files" =~ ^[0-9]+$ ]] && [ "$quarantine_files" -gt 0 ]; then
             additional_info="$additional_info, quarantine: $quarantine_files files"
         fi
-        
-        clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - ClamAV functioning optimally: $scans scans performed today, $db_activity$additional_info, no infections detected"
+        clamav_details="Health Level: $clamav_threat_level (Score: ${health_score}/100) - ClamAV functioning optimally: $scans scans performed today, $db_activity$additional_info, no infections detected - No action needed."
     fi
     
     detailed_report["clamav"]="$clamav_details"
@@ -3714,19 +3714,18 @@ check_fail2ban_status() {
     local fail2ban_details=""
         if [ "$threat_level" = "CRITICAL" ]; then
         critical_modules_found+=("Fail2Ban")
-            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Critical security activity today - $total_bans_today bans, $total_currently_banned currently banned IPs"
+            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Critical security activity: $total_bans_today bans, $total_currently_banned currently banned IPs - Immediate action required: Review security logs."
         elif [ "$threat_level" = "POOR" ]; then
             high_modules_found+=("Fail2Ban")
-            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Elevated security activity today - $total_bans_today bans, $total_currently_banned currently banned IPs"
+            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Elevated security activity: $total_bans_today bans, $total_currently_banned currently banned IPs - Action recommended: Monitor attack patterns."
         elif [ "$threat_level" = "FAIR" ]; then
         medium_modules_found+=("Fail2Ban")
-            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Moderate security activity today - $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs. Fail2Ban working effectively."
+            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Moderate security activity: $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs - Monitor closely for potential escalation."
         elif [ "$threat_level" = "GOOD" ]; then
             low_modules_found+=("Fail2Ban")
-            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Normal security activity today - $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs. System secure."
+            fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Normal security activity: $total_bans_today bans, $total_attempts_today failed attempts, $total_currently_banned currently banned IPs - Routine monitoring recommended."
         else
-        # EXCELLENT level - no issues
-        fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Fail2Ban functioning normally today: $total_attempts_today failed attempts, $total_bans_today bans, $total_unbans_today unbans, $total_currently_banned currently banned IPs. System secure."
+        fail2ban_details="Health Level: $threat_level (Score: ${health_score}/100) - Fail2Ban functioning optimally: $total_attempts_today failed attempts, $total_bans_today bans, $total_unbans_today unbans, $total_currently_banned currently banned IPs - No action needed."
     fi
     
     detailed_report["fail2ban"]="$fail2ban_details"
